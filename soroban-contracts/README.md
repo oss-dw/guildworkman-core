@@ -570,6 +570,8 @@ stellar contract invoke --id $EMISSIONS --source admin --network testnet \
 
 ### dispute-resolution
 
+> ⚠️ **v1, unaudited, no appeals** — single-round staked-jury voting with no sybil-resistant/weighted jury selection. Read [Security considerations / known limitations](#security-considerations--known-limitations) before integrating.
+
 Decentralized dispute resolution: a staked jury decides the outcome via
 commit-reveal voting, and the majority is paid out of the slashed stakes of the
 minority and no-shows. This is the trust-minimized counterpart to `escrow`'s
@@ -743,14 +745,19 @@ stellar contract invoke --id $DISPUTES --source juror --network testnet \
   — there is no random jury selection, reputation weighting, or per-identity
   gating. Set `juror_stake`/`min_jurors` relative to the value at stake, and
   treat this as a coordination mechanism among semi-trusted jurors, not a
-  Kleros-grade court.
+  Kleros-grade court. Reputation-weighted / randomized jury selection (building
+  on the attestation-based reputation scoring in #20) is a deliberate v1 scope
+  boundary tracked in #29, not an oversight.
 - **No appeals and majority-takes-all slashing.** A dispute resolves in a single
   round; there is no appeal path, and honest jurors who happen to land in the
   minority are slashed alongside malicious ones. A dishonest majority both wins
   the verdict and confiscates the honest minority's stake. Ties and below-quorum
   turnouts are handled safely (everyone is refunded, no slashing), and integer
   division of the slashed pot can leave at most `winner_count - 1` units of dust
-  in the contract.
+  in the contract. Slashing the whole minority is an intentional Schelling-point
+  incentive (commit-reveal is what makes it defensible), but softening it for
+  close calls — margin-based partial refunds or an appeal round — is tracked as a
+  candidate v2 direction in #29.
 - **Reveal-phase liveness assumption.** A juror who commits but never reveals is
   treated as a loser and slashed (on a decided outcome), which is the intended
   anti-griefing incentive — but it also means a juror censored or offline during
