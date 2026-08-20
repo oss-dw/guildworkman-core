@@ -188,3 +188,120 @@ fn migrate_by_non_signer_fails() {
     let result = contract.try_migrate(&outsider);
     assert_eq!(result, Err(Ok(Error::NotASigner)));
 }
+
+// ===========================================================================
+// Emergency circuit breaker
+// ===========================================================================
+//
+// The breaker's own semantics are unit-tested in
+// `guildworkman-governance-guard`. The property that matters here is narrow
+// and absolute: `mint` is halted, and nothing a holder does with a balance
+// they already own ever is.
+
+fn set_time(env: &Env, timestamp: u64) {
+    use soroban_sdk::testutils::Ledger as _;
+    env.ledger().with_mut(|l| l.timestamp = timestamp);
+}
+
+#[test]
+fn paused_intake_blocks_minting() {
+    let (env, contract, signers) = setup_with_signers();
+    let user = Address::generate(&env);
+
+    set_time(&env, 1_000);
+    contract.pause(&signers.get_unchecked(0), &SCOPE_INTAKE, &3_600);
+
+    let res = contract.try_mint(&user, &1_000);
+    assert_eq!(res, Err(Ok(Error::OperationPaused)));
+    assert_eq!(contract.balance(&user), 0);
+}
+
+#[test]
+fn holders_keep_full_control_of_existing_balances_while_everything_is_paused() {
+    // The whole point of guarding only `mint`: a holder's points are their
+    // property, and a halt must never reach them.
+    let (env, contract, signers) = setup_with_signers();
+    let user = Address::generate(&env);
+    let other = Address::generate(&env);
+    let spender = Address::generate(&env);
+    contract.mint(&user, &1_000);
+
+    set_time(&env, 1_000);
+    contract.pause(&signers.get_unchecked(0), &ALL_SCOPES, &3_600);
+    assert_eq!(contract.paused_scopes(), ALL_SCOPES);
+
+    contract.transfer(&user, &other, &100);
+    assert_eq!(contract.balance(&other), 100);
+
+    contract.approve(&user, &spender, &200, &10_000);
+    contract.transfer_from(&spender, &user, &other, &200);
+    assert_eq!(contract.balance(&other), 300);
+
+    contract.burn(&user, &50);
+    assert_eq!(contract.balance(&user), 650);
+
+    // And the pause is genuinely still in force — these worked because they
+    // are exempt, not because the halt lapsed.
+    assert_eq!(contract.paused_scopes(), ALL_SCOPES);
+    assert_eq!(
+        contract.try_mint(&user, &1),
+        Err(Ok(Error::OperationPaused))
+    );
+}
+
+#[test]
+fn minting_resumes_on_its_own_once_the_pause_expires() {
+    let (env, contract, signers) = setup_with_signers();
+    let user = Address::generate(&env);
+
+    set_time(&env, 1_000);
+    contract.pause(&signers.get_unchecked(0), &SCOPE_INTAKE, &3_600);
+    assert_eq!(
+        contract.try_mint(&user, &1_000),
+        Err(Ok(Error::OperationPaused))
+    );
+
+    // No unpause transaction; only the clock moves.
+    set_time(&env, 4_600);
+
+    assert_eq!(contract.paused_scopes(), 0);
+    contract.mint(&user, &1_000);
+    assert_eq!(contract.balance(&user), 1_000);
+}
+
+#[test]
+fn a_non_signer_cannot_pause_the_token() {
+    let (env, contract, _signers) = setup_with_signers();
+    let outsider = Address::generate(&env);
+
+    let res = contract.try_pause(&outsider, &ALL_SCOPES, &3_600);
+    assert_eq!(res, Err(Ok(Error::NotASigner)));
+    assert_eq!(contract.paused_scopes(), 0);
+}
+
+#[test]
+fn a_pause_longer_than_the_cap_is_refused() {
+    let (env, contract, signers) = setup_with_signers();
+    set_time(&env, 1_000);
+
+    let res = contract.try_pause(
+        &signers.get_unchecked(0),
+        &SCOPE_INTAKE,
+        &(MAX_PAUSE_DURATION + 1),
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidPauseDuration)));
+    assert_eq!(contract.paused_scopes(), 0);
+}
+
+#[test]
+fn any_signer_can_lift_a_pause_placed_by_another() {
+    let (env, contract, signers) = setup_with_signers();
+    let user = Address::generate(&env);
+
+    set_time(&env, 1_000);
+    contract.pause(&signers.get_unchecked(0), &SCOPE_INTAKE, &3_600);
+    assert_eq!(contract.unpause(&signers.get_unchecked(2), &ALL_SCOPES), 0);
+
+    contract.mint(&user, &1_000);
+    assert_eq!(contract.balance(&user), 1_000);
+}

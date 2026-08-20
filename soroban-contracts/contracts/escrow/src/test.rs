@@ -780,3 +780,307 @@ fn get_milestone_not_found_returns_error() {
     let res = ctx.contract.try_get_milestone(&1, &0);
     assert_eq!(res, Err(Ok(Error::MilestoneNotFound)));
 }
+
+// ===========================================================================
+// Emergency circuit breaker
+// ===========================================================================
+//
+// The primitive itself (scope arithmetic, expiry, auth) is unit-tested in
+// `guildworkman-governance-guard`. What matters here is the wiring: that the
+// intake and settlement entrypoints are guarded, and — the property the whole
+// design rests on — that every fund-recovery entrypoint is *not*.
+
+fn set_time(env: &Env, timestamp: u64) {
+    env.ledger().with_mut(|l| l.timestamp = timestamp);
+}
+
+/// Halts every scope for an hour, from an arbitrary non-zero clock so that
+/// "before" and "after the deadline" are both expressible.
+fn pause_everything(ctx: &TestCtx) -> u64 {
+    set_time(&ctx.env, 1_000);
+    ctx.contract
+        .pause(&ctx.signers.get_unchecked(0), &ALL_SCOPES, &3_600);
+    1_000
+}
+
+// ----- Intake is halted -----
+
+#[test]
+fn paused_intake_blocks_new_appointments_and_moves_no_money() {
+    let ctx = setup();
+    pause_everything(&ctx);
+
+    let res =
+        ctx.contract
+            .try_create_appointment(&1, &ctx.client, &ctx.worker, &ctx.token, &10_000);
+    assert_eq!(res, Err(Ok(Error::OperationPaused)));
+
+    // No funds entered the contract.
+    assert_eq!(ctx.token_client.balance(&ctx.client), 1_000_000);
+    assert_eq!(ctx.token_client.balance(&ctx.contract.address), 0);
+}
+
+#[test]
+fn paused_intake_blocks_new_milestone_escrows_and_milestones() {
+    let ctx = setup();
+    set_ledger(&ctx.env, 100);
+    ctx.contract
+        .create_milestone_escrow(&1, &milestone_escrow_init(&ctx));
+
+    set_time(&ctx.env, 1_000);
+    ctx.contract
+        .pause(&ctx.signers.get_unchecked(0), &SCOPE_INTAKE, &3_600);
+
+    let res = ctx
+        .contract
+        .try_create_milestone_escrow(&2, &milestone_escrow_init(&ctx));
+    assert_eq!(res, Err(Ok(Error::OperationPaused)));
+
+    let res = ctx
+        .contract
+        .try_add_milestone(&1, &desc(&ctx.env, 1), &5_000, &200);
+    assert_eq!(res, Err(Ok(Error::OperationPaused)));
+}
+
+// ----- Recovery survives a total pause -----
+
+#[test]
+fn a_client_can_still_cancel_and_be_refunded_while_everything_is_paused() {
+    // The headline guarantee: money already in escrow gets out, even with
+    // every scope the breaker knows about halted at once.
+    let ctx = setup();
+    ctx.contract
+        .create_appointment(&1, &ctx.client, &ctx.worker, &ctx.token, &10_000);
+    assert_eq!(ctx.token_client.balance(&ctx.contract.address), 10_000);
+
+    pause_everything(&ctx);
+    assert_eq!(ctx.contract.paused_scopes(), ALL_SCOPES);
+
+    ctx.contract.cancel_appointment(&1);
+
+    assert_eq!(ctx.token_client.balance(&ctx.client), 1_000_000);
+    assert_eq!(ctx.token_client.balance(&ctx.contract.address), 0);
+    assert_eq!(ctx.contract.get_appointment(&1).status, Status::Cancelled);
+    // Still paused afterwards — the recovery path is exempt, not a lift.
+    assert_eq!(ctx.contract.paused_scopes(), ALL_SCOPES);
+}
+
+#[test]
+fn disputes_can_still_be_raised_and_resolved_while_everything_is_paused() {
+    let ctx = setup();
+    ctx.contract
+        .create_appointment(&1, &ctx.client, &ctx.worker, &ctx.token, &10_000);
+
+    pause_everything(&ctx);
+
+    ctx.contract.raise_dispute(&1, &ctx.worker);
+    assert_eq!(ctx.contract.get_appointment(&1).status, Status::Disputed);
+
+    ctx.contract.resolve_dispute(&1, &false);
+    assert_eq!(ctx.token_client.balance(&ctx.worker), 10_000);
+    assert_eq!(ctx.token_client.balance(&ctx.contract.address), 0);
+}
+
+#[test]
+fn milestone_disputes_resolve_while_everything_is_paused() {
+    let ctx = setup();
+    set_ledger(&ctx.env, 100);
+    ctx.contract
+        .create_milestone_escrow(&1, &milestone_escrow_init(&ctx));
+    ctx.contract
+        .add_milestone(&1, &desc(&ctx.env, 1), &10_000, &200);
+    ctx.contract.raise_milestone_dispute(&1, &0, &ctx.client);
+
+    pause_everything(&ctx);
+
+    // Both halves of the milestone recovery route stay open.
+    ctx.contract.resolve_milestone_dispute(&1, &0, &true);
+    assert_eq!(ctx.token_client.balance(&ctx.client), 1_000_000);
+    assert_eq!(ctx.token_client.balance(&ctx.contract.address), 0);
+}
+
+// ----- Scope isolation across entrypoints -----
+
+#[test]
+fn pausing_intake_alone_leaves_settlement_working() {
+    let ctx = setup();
+    ctx.contract
+        .create_appointment(&1, &ctx.client, &ctx.worker, &ctx.token, &10_000);
+
+    set_time(&ctx.env, 1_000);
+    ctx.contract
+        .pause(&ctx.signers.get_unchecked(0), &SCOPE_INTAKE, &3_600);
+
+    // Existing business settles normally; only new business is halted.
+    ctx.contract.confirm_completion(&1);
+    assert_eq!(ctx.token_client.balance(&ctx.worker), 10_000);
+}
+
+#[test]
+fn pausing_settlement_alone_blocks_payout_but_not_new_appointments() {
+    let ctx = setup();
+    ctx.contract
+        .create_appointment(&1, &ctx.client, &ctx.worker, &ctx.token, &10_000);
+
+    set_time(&ctx.env, 1_000);
+    ctx.contract
+        .pause(&ctx.signers.get_unchecked(0), &SCOPE_SETTLEMENT, &3_600);
+
+    let res = ctx.contract.try_confirm_completion(&1);
+    assert_eq!(res, Err(Ok(Error::OperationPaused)));
+    assert_eq!(ctx.token_client.balance(&ctx.worker), 0);
+
+    // Intake was never named, so it is untouched.
+    ctx.contract
+        .create_appointment(&2, &ctx.client, &ctx.worker, &ctx.token, &5_000);
+}
+
+#[test]
+fn paused_settlement_blocks_milestone_approval_and_release() {
+    let ctx = setup();
+    set_ledger(&ctx.env, 100);
+    ctx.contract
+        .create_milestone_escrow(&1, &milestone_escrow_init(&ctx));
+    ctx.contract
+        .add_milestone(&1, &desc(&ctx.env, 1), &10_000, &200);
+    ctx.contract.approve_milestone(&1, &0);
+    set_ledger(&ctx.env, 201);
+
+    set_time(&ctx.env, 1_000);
+    ctx.contract
+        .pause(&ctx.signers.get_unchecked(0), &SCOPE_SETTLEMENT, &3_600);
+
+    // The permissionless release is exactly what the scope exists to stop.
+    let res = ctx.contract.try_release_milestone_funds(&1, &0);
+    assert_eq!(res, Err(Ok(Error::OperationPaused)));
+    assert_eq!(ctx.token_client.balance(&ctx.contract.address), 10_000);
+
+    let res = ctx.contract.try_approve_milestone(&1, &0);
+    assert_eq!(res, Err(Ok(Error::OperationPaused)));
+}
+
+// ----- Auto-expiry -----
+
+#[test]
+fn intake_resumes_on_its_own_once_the_pause_expires() {
+    let ctx = setup();
+    let start = pause_everything(&ctx);
+
+    let res =
+        ctx.contract
+            .try_create_appointment(&1, &ctx.client, &ctx.worker, &ctx.token, &10_000);
+    assert_eq!(res, Err(Ok(Error::OperationPaused)));
+
+    // No unpause transaction. Only the ledger clock advances.
+    set_time(&ctx.env, start + 3_600);
+
+    assert_eq!(ctx.contract.paused_scopes(), 0);
+    assert!(ctx.contract.get_pause_state().is_none());
+    ctx.contract
+        .create_appointment(&1, &ctx.client, &ctx.worker, &ctx.token, &10_000);
+    assert_eq!(ctx.token_client.balance(&ctx.contract.address), 10_000);
+}
+
+#[test]
+fn a_pause_longer_than_the_cap_is_refused_outright() {
+    let ctx = setup();
+    set_time(&ctx.env, 1_000);
+
+    let res = ctx.contract.try_pause(
+        &ctx.signers.get_unchecked(0),
+        &ALL_SCOPES,
+        &(MAX_PAUSE_DURATION + 1),
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidPauseDuration)));
+    assert_eq!(ctx.contract.paused_scopes(), 0);
+}
+
+// ----- Authorization (adversarial) -----
+
+#[test]
+fn a_non_signer_cannot_pause_the_escrow() {
+    let ctx = setup();
+    let outsider = Address::generate(&ctx.env);
+
+    let res = ctx.contract.try_pause(&outsider, &ALL_SCOPES, &3_600);
+    assert_eq!(res, Err(Ok(Error::NotASigner)));
+    assert_eq!(ctx.contract.paused_scopes(), 0);
+
+    // And business is genuinely unaffected, not merely reported as open.
+    ctx.contract
+        .create_appointment(&1, &ctx.client, &ctx.worker, &ctx.token, &10_000);
+}
+
+#[test]
+fn the_admin_arbiter_is_not_a_pause_authority() {
+    // `admin` resolves disputes; the breaker answers to the rotatable
+    // governance signer set instead. Pinning this down stops a later change
+    // from quietly widening who can halt the protocol.
+    let ctx = setup();
+    let res = ctx.contract.try_pause(&ctx.admin, &ALL_SCOPES, &3_600);
+    assert_eq!(res, Err(Ok(Error::NotASigner)));
+}
+
+#[test]
+fn a_non_signer_cannot_unpause_the_escrow() {
+    let ctx = setup();
+    pause_everything(&ctx);
+    let outsider = Address::generate(&ctx.env);
+
+    let res = ctx.contract.try_unpause(&outsider, &ALL_SCOPES);
+    assert_eq!(res, Err(Ok(Error::NotASigner)));
+    assert_eq!(ctx.contract.paused_scopes(), ALL_SCOPES);
+}
+
+#[test]
+fn any_single_signer_can_lift_a_pause_another_signer_placed() {
+    // Deliberately unilateral in both directions: a responder who placed a
+    // pause and then went offline must not be able to wedge it in place.
+    let ctx = setup();
+    pause_everything(&ctx);
+
+    let remaining = ctx
+        .contract
+        .unpause(&ctx.signers.get_unchecked(2), &ALL_SCOPES);
+    assert_eq!(remaining, 0);
+    ctx.contract
+        .create_appointment(&1, &ctx.client, &ctx.worker, &ctx.token, &10_000);
+}
+
+// ----- Partial lift & views -----
+
+#[test]
+fn unpausing_intake_alone_reopens_bookings_while_settlement_stays_halted() {
+    let ctx = setup();
+    ctx.contract
+        .create_appointment(&1, &ctx.client, &ctx.worker, &ctx.token, &10_000);
+    pause_everything(&ctx);
+
+    let remaining = ctx
+        .contract
+        .unpause(&ctx.signers.get_unchecked(1), &SCOPE_INTAKE);
+    assert_eq!(remaining & SCOPE_INTAKE, 0);
+    assert_eq!(remaining & SCOPE_SETTLEMENT, SCOPE_SETTLEMENT);
+
+    ctx.contract
+        .create_appointment(&2, &ctx.client, &ctx.worker, &ctx.token, &5_000);
+    let res = ctx.contract.try_confirm_completion(&1);
+    assert_eq!(res, Err(Ok(Error::OperationPaused)));
+}
+
+#[test]
+fn pause_views_report_who_paused_and_until_when() {
+    let ctx = setup();
+    let signer = ctx.signers.get_unchecked(1);
+    set_time(&ctx.env, 1_000);
+    ctx.contract.pause(&signer, &SCOPE_INTAKE, &7_200);
+
+    let state = ctx.contract.get_pause_state().unwrap();
+    assert_eq!(state.scopes, SCOPE_INTAKE);
+    assert_eq!(state.paused_by, signer);
+    assert_eq!(state.paused_at, 1_000);
+    assert_eq!(state.expires_at, 8_200);
+
+    assert!(ctx.contract.is_paused(&SCOPE_INTAKE));
+    assert!(!ctx.contract.is_paused(&SCOPE_SETTLEMENT));
+}

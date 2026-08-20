@@ -18,6 +18,10 @@ struct Fixture<'a> {
     token: RealLoyaltyTokenClient<'a>,
     admin: Address,
     signers: Vec<Address>,
+    /// The underlying token's *own* governance signers — distinct from
+    /// `signers`, which govern the emission engine. Needed to exercise the
+    /// case where the token halts minting underneath a healthy engine.
+    token_signers: Vec<Address>,
 }
 
 fn make_signers(env: &Env, n: u32) -> Vec<Address> {
@@ -40,6 +44,7 @@ fn setup<'a>() -> Fixture<'a> {
     // Underlying loyalty token.
     let token_id = env.register(RealLoyaltyToken, ());
     let token = RealLoyaltyTokenClient::new(&env, &token_id);
+    let token_signers = make_signers(&env, 1);
     token.initialize(
         &token_admin,
         &token_admin, // temporary minter, rotated to the engine below
@@ -47,7 +52,7 @@ fn setup<'a>() -> Fixture<'a> {
         &String::from_str(&env, "GuildWorkman Points"),
         &String::from_str(&env, "GWP"),
         &governance::GovernanceInit {
-            signers: make_signers(&env, 1),
+            signers: token_signers.clone(),
             threshold: 1,
         },
     );
@@ -80,6 +85,7 @@ fn setup<'a>() -> Fixture<'a> {
         token,
         admin,
         signers,
+        token_signers,
     }
 }
 
@@ -601,4 +607,209 @@ fn migrate_by_non_signer_fails() {
     let outsider = Address::generate(&f.env);
     let result = f.emissions.try_migrate(&outsider);
     assert_eq!(result, Err(Ok(Error::NotASigner)));
+}
+
+// ---------------------------------------------------------------------------
+// Emergency circuit breaker
+// ---------------------------------------------------------------------------
+//
+// The breaker's own semantics live in `guildworkman-governance-guard`'s unit
+// tests. These cover the engine's wiring, plus the one genuinely cross-contract
+// case: the token halting mint underneath a healthy engine.
+
+fn set_time(env: &Env, timestamp: u64) {
+    env.ledger().with_mut(|l| l.timestamp = timestamp);
+}
+
+#[test]
+fn paused_intake_blocks_new_schedules() {
+    let f = setup();
+    let user = Address::generate(&f.env);
+    set_ledger(&f.env, 1_000);
+    set_time(&f.env, 1_000);
+    f.emissions
+        .pause(&f.signers.get_unchecked(0), &SCOPE_INTAKE, &3_600);
+
+    let res = f
+        .emissions
+        .try_create_schedule(&user, &1_000, &0, &0, &1_000, &2_000);
+    assert_eq!(res, Err(Ok(Error::OperationPaused)));
+    assert_eq!(
+        f.emissions.try_get_schedule(&user),
+        Err(Ok(Error::ScheduleNotFound))
+    );
+}
+
+#[test]
+fn paused_settlement_blocks_claims_and_mints_nothing() {
+    let f = setup();
+    let user = Address::generate(&f.env);
+    set_ledger(&f.env, 1_000);
+    f.emissions
+        .create_schedule(&user, &1_000, &0, &0, &1_000, &2_000);
+
+    set_ledger(&f.env, 1_500);
+    set_time(&f.env, 1_000);
+    f.emissions
+        .pause(&f.signers.get_unchecked(0), &SCOPE_SETTLEMENT, &3_600);
+
+    let res = f.emissions.try_claim(&user);
+    assert_eq!(res, Err(Ok(Error::OperationPaused)));
+    assert_eq!(f.token.balance(&user), 0);
+    assert_eq!(f.emissions.get_schedule(&user).claimed, 0);
+}
+
+#[test]
+fn a_halted_claim_loses_nothing_because_vesting_keeps_accruing() {
+    // The reason halting `claim` is a delay rather than a confiscation:
+    // `vested` is a pure function of the ledger clock, so the beneficiary
+    // gets the same units afterwards, only later.
+    let f = setup();
+    let user = Address::generate(&f.env);
+    set_ledger(&f.env, 1_000);
+    f.emissions
+        .create_schedule(&user, &1_000, &0, &0, &1_000, &2_000);
+
+    set_ledger(&f.env, 1_500);
+    set_time(&f.env, 1_000);
+    f.emissions
+        .pause(&f.signers.get_unchecked(0), &SCOPE_SETTLEMENT, &3_600);
+    assert_eq!(
+        f.emissions.try_claim(&user),
+        Err(Ok(Error::OperationPaused))
+    );
+
+    // Vesting continued through the halt, and it lifts with no transaction.
+    set_ledger(&f.env, 1_900);
+    set_time(&f.env, 4_600);
+    assert_eq!(f.emissions.paused_scopes(), 0);
+    assert_eq!(f.emissions.claim(&user), 900);
+    assert_eq!(f.token.balance(&user), 900);
+}
+
+#[test]
+fn reclaim_stays_open_while_settlement_is_halted() {
+    // `reclaim` mints and burns nothing — it only marks an allocation as
+    // never-to-be-minted — so it is not a fund-recovery path that must stay
+    // open, but it is also not one a pause needs to close. Pinned here so
+    // the asymmetry documented on `reclaim` is a tested fact.
+    let f = setup();
+    let user = Address::generate(&f.env);
+    set_ledger(&f.env, 1_000);
+    f.emissions
+        .create_schedule(&user, &1_000, &0, &0, &1_000, &2_000);
+
+    set_ledger(&f.env, 2_000);
+    set_time(&f.env, 1_000);
+    f.emissions
+        .pause(&f.signers.get_unchecked(0), &ALL_SCOPES, &3_600);
+
+    assert_eq!(f.emissions.reclaim(&user), 1_000);
+    assert_eq!(f.token.balance(&user), 0);
+}
+
+#[test]
+fn views_stay_readable_while_everything_is_halted() {
+    let f = setup();
+    let user = Address::generate(&f.env);
+    set_ledger(&f.env, 1_000);
+    f.emissions
+        .create_schedule(&user, &1_000, &0, &0, &1_000, &2_000);
+
+    set_ledger(&f.env, 1_500);
+    set_time(&f.env, 1_000);
+    f.emissions
+        .pause(&f.signers.get_unchecked(0), &ALL_SCOPES, &3_600);
+
+    assert_eq!(f.emissions.vested(&user), 500);
+    assert_eq!(f.emissions.claimable(&user), 500);
+    assert_eq!(f.emissions.get_schedule(&user).total, 1_000);
+}
+
+#[test]
+fn pausing_the_token_alone_stops_claims_at_the_mint_boundary() {
+    // The engine holds the token's `minter` role, so halting token intake
+    // stops emissions even with the engine itself wide open. The failure
+    // surfaces as a trapped cross-contract invocation rather than this
+    // contract's own typed error, since the engine calls `mint` through the
+    // non-`try` client — what matters is that no supply is created.
+    let f = setup();
+    let user = Address::generate(&f.env);
+    set_ledger(&f.env, 1_000);
+    f.emissions
+        .create_schedule(&user, &1_000, &0, &0, &1_000, &2_000);
+
+    set_ledger(&f.env, 1_500);
+    set_time(&f.env, 1_000);
+    f.token
+        .pause(&f.token_signers.get_unchecked(0), &SCOPE_INTAKE, &3_600);
+
+    assert_eq!(f.emissions.paused_scopes(), 0);
+    assert!(f.emissions.try_claim(&user).is_err());
+    assert_eq!(f.token.balance(&user), 0);
+    assert_eq!(f.emissions.get_schedule(&user).claimed, 0);
+
+    // Lifting the token's halt is enough; the engine needed no change.
+    f.token
+        .unpause(&f.token_signers.get_unchecked(0), &SCOPE_INTAKE);
+    assert_eq!(f.emissions.claim(&user), 500);
+    assert_eq!(f.token.balance(&user), 500);
+}
+
+#[test]
+fn a_non_signer_cannot_pause_the_engine() {
+    let f = setup();
+    let outsider = Address::generate(&f.env);
+
+    let res = f.emissions.try_pause(&outsider, &ALL_SCOPES, &3_600);
+    assert_eq!(res, Err(Ok(Error::NotASigner)));
+    assert_eq!(f.emissions.paused_scopes(), 0);
+}
+
+#[test]
+fn the_emissions_admin_is_not_a_pause_authority() {
+    let f = setup();
+    let res = f.emissions.try_pause(&f.admin, &ALL_SCOPES, &3_600);
+    assert_eq!(res, Err(Ok(Error::NotASigner)));
+}
+
+#[test]
+fn a_pause_longer_than_the_cap_is_refused() {
+    let f = setup();
+    set_time(&f.env, 1_000);
+
+    let res = f.emissions.try_pause(
+        &f.signers.get_unchecked(0),
+        &ALL_SCOPES,
+        &(MAX_PAUSE_DURATION + 1),
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidPauseDuration)));
+    assert_eq!(f.emissions.paused_scopes(), 0);
+}
+
+#[test]
+fn unpausing_settlement_alone_reopens_claims_while_intake_stays_halted() {
+    let f = setup();
+    let user = Address::generate(&f.env);
+    let other = Address::generate(&f.env);
+    set_ledger(&f.env, 1_000);
+    f.emissions
+        .create_schedule(&user, &1_000, &0, &0, &1_000, &2_000);
+
+    set_ledger(&f.env, 1_500);
+    set_time(&f.env, 1_000);
+    f.emissions
+        .pause(&f.signers.get_unchecked(0), &ALL_SCOPES, &3_600);
+
+    let remaining = f
+        .emissions
+        .unpause(&f.signers.get_unchecked(1), &SCOPE_SETTLEMENT);
+    assert_eq!(remaining & SCOPE_SETTLEMENT, 0);
+    assert_eq!(remaining & SCOPE_INTAKE, SCOPE_INTAKE);
+
+    assert_eq!(f.emissions.claim(&user), 500);
+    let res = f
+        .emissions
+        .try_create_schedule(&other, &1_000, &0, &0, &1_000, &2_000);
+    assert_eq!(res, Err(Ok(Error::OperationPaused)));
 }
