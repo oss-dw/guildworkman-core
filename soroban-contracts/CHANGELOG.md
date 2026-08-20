@@ -17,7 +17,8 @@ sections start once something ships.
 ### Added
 
 - **Emergency circuit breaker across `escrow`, `reputation`, `loyalty-token`
-  and `loyalty-emissions`** (#42, PR #46). A shared pausability primitive in
+  and `loyalty-emissions`** ([#42](https://github.com/workman-labs/guildworkman-core/issues/42),
+  [PR #46](https://github.com/workman-labs/guildworkman-core/pull/46)). A shared pausability primitive in
   `contracts/governance-guard`'s new `pausable` module, built so that a halt
   can never become a fund trap:
   - **Scoped guards** rather than one global flag — `SCOPE_INTAKE`,
