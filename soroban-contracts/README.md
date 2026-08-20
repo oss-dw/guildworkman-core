@@ -142,6 +142,12 @@ identical across all four, only the numbers differ.
 
 ## Emergency circuit breaker
 
+Jump to: [Pause authorization](#pause-authorization) ·
+[Pause entrypoints](#pause-entrypoints) · [Events](#events) ·
+[Pause errors](#pause-errors) · [Pause storage layout](#pause-storage-layout) ·
+[Which clock](#which-clock) · [Hot-path cost](#hot-path-cost) ·
+[Pausing from the CLI](#pausing-from-the-cli)
+
 The same four contracts can be **paused** during an incident. The primitive
 lives in `contracts/governance-guard`'s `pausable` module, next to the
 upgrade guard and for the same reason: every contract that needs it already
@@ -199,7 +205,9 @@ clears*, and *no pause of any duration can stop a user from recovering funds
 they already own*. The second half is what keeps the residual risk a liveness
 problem for new business rather than a custody problem for existing balances.
 
-**Authorization.** `pause` and `unpause` require **any single governance
+#### Pause authorization
+
+`pause` and `unpause` require **any single governance
 signer** — not the full M-of-N threshold, and deliberately not each
 contract's own `admin`. Gathering a threshold takes time an incident doesn't
 give you, and the action being authorized is bounded on every axis that
@@ -210,7 +218,9 @@ loss of any one key — an incident is exactly when a single non-rotatable key
 is least trustworthy. `unpause` is unilateral in the same way, so a responder
 who places a pause and then goes offline cannot wedge it in place.
 
-**Entrypoints**, added to all four contracts:
+#### Pause entrypoints
+
+Added to all four contracts:
 
 - `pause(caller: Address, scopes: u32, duration_secs: u64, reason: String) -> PauseState`
 - `unpause(caller: Address, scopes: u32) -> u32` — clears only the named
@@ -225,23 +235,76 @@ who places a pause and then goes offline cannot wedge it in place.
 - `paused_scopes() -> u32`, `is_paused(scope: u32) -> bool` — narrower
   convenience views over the same record.
 
-`reason` is free-form operator context of at most **64 bytes**
-(`MAX_PAUSE_REASON_LEN`), and may be empty — the field must never stand between
-a responder and a halt. It is stored and emitted verbatim, never interpreted,
-so "why is this halted?" is answerable from chain state instead of from a
-chat log nobody can find at 3am. It is length-capped because it lives in
-instance storage, which every subsequent invocation pays to load; an incident
-ticket reference belongs on-chain, the incident write-up does not.
+`reason` is free-form operator context, may be empty, and is stored and
+emitted verbatim — never parsed or compared — so "why is this halted?" is
+answerable from chain state instead of from a chat log nobody can find at
+3am. It is length-capped because it lives in instance storage that every
+subsequent invocation pays to load: an incident ticket reference belongs
+on-chain, the write-up does not.
 
-Two events let off-chain monitoring react: `Paused { caller, scopes,
-expires_at, reason }` (topics `["gov_pause", "paused", caller]`) and
-`Unpaused { caller, scopes, remaining_scopes }` (topics `["gov_pause",
-"unpaused", caller]`). Auto-expiry emits nothing — it is a read-time
-evaluation with no transaction behind it, so monitors should treat the
-`expires_at` carried by `Paused` as the authoritative end of the window
-unless an `Unpaused` arrives sooner.
+> **The cap is 64 UTF-8 _bytes_, not characters.** `MAX_PAUSE_REASON_LEN`
+> bounds what `String::len()` reports, which is the byte length. For ASCII
+> the two are identical, which is exactly why this is worth stating: a
+> 33-character reason made of two-byte code points is **66 bytes and is
+> rejected**, even though a character-count check would have passed it.
+> Client-side validation must count bytes — `Buffer.byteLength(s, 'utf8')`
+> in JS, `len(s.encode('utf-8'))` in Python — or restrict input to ASCII.
+> Both boundaries are pinned by tests
+> (`a_multibyte_reason_is_measured_in_bytes_and_accepted_at_exactly_the_cap`
+> and `…_over_the_byte_cap_is_rejected_despite_a_short_char_count` in
+> `contracts/governance-guard/src/pausable_test.rs`).
 
-**Errors.** Four variants per contract, at whatever offset came next in that
+#### Events
+
+Two events let off-chain monitoring react. Both shapes are pinned by
+assertion in `contracts/escrow/src/test.rs`
+(`paused_event_has_the_documented_topics_and_data_shape` and its `unpaused`
+counterpart), so this table cannot drift from what is emitted without a test
+failing.
+
+Topics are ordered: the two prefix symbols first, then each `#[topic]` field
+in declaration order. Data is a **`Map<Symbol, Val>` keyed by field name**
+(`data_format` defaults to `"map"`), so field *names* are part of the
+contract but their order is not — index by key, not by position.
+
+| Event | Topics (in order) | Data map |
+|---|---|---|
+| `Paused` | `Symbol("gov_pause")`, `Symbol("paused")`, `Address(caller)` | `expires_at: u64`, `reason: String`, `scopes: u32` |
+| `Unpaused` | `Symbol("gov_pause")`, `Symbol("unpaused")`, `Address(caller)` | `scopes: u32`, `remaining_scopes: u32` |
+
+`scopes` on `Paused` is the full set halted *after* the call — the new state,
+not a delta. On `Unpaused` it is the set that call *cleared*, with
+`remaining_scopes` the set still halted afterwards (`0` when fully lifted).
+
+As an indexer would see them, after
+`pause(signer, SCOPE_INTAKE, 7200, "INC-412")` at ledger timestamp `1000`,
+then `unpause(signer, SCOPE_INTAKE)`:
+
+```jsonc
+// Paused
+{
+  "contract": "C…ESCROW",
+  "topics": ["gov_pause", "paused", "G…SIGNER"],
+  "data": { "scopes": 1, "expires_at": 8200, "reason": "INC-412" }
+}
+// Unpaused
+{
+  "contract": "C…ESCROW",
+  "topics": ["gov_pause", "unpaused", "G…SIGNER"],
+  "data": { "scopes": 1, "remaining_scopes": 0 }
+}
+```
+
+**Auto-expiry emits nothing.** It is a read-time evaluation with no
+transaction behind it, so there is no execution context to emit from — which
+is the same property that makes expiry trustworthy in the first place.
+Monitors should treat the `expires_at` carried by `Paused` as the
+authoritative end of a window unless an `Unpaused` arrives sooner, and must
+not wait for an event that will never come.
+
+#### Pause errors
+
+Five variants per contract, at whatever offset came next in that
 contract's existing `Error` enum — identical names, different numbers:
 
 | Variant | `escrow` | `reputation` | `loyalty-token` | `loyalty-emissions` | Meaning |
@@ -254,7 +317,9 @@ contract's existing `Error` enum — identical names, different numbers:
 
 A non-signer calling `pause`/`unpause` gets the existing `NotASigner`.
 
-**Storage.** One instance-storage entry, `GovernanceDataKey::PauseState`,
+#### Pause storage layout
+
+One instance-storage entry, `GovernanceDataKey::PauseState`,
 holding `PauseState { scopes, expires_at, paused_by, paused_at, reason }`.
 Appended after `PendingRotation` so already-deployed contracts' key encodings
 stay put. Only one record exists at a time — a second `pause` replaces the
@@ -263,7 +328,9 @@ are always readable from one place. `paused_by` is recorded for attribution
 and grants no rights: any signer may lift a pause, not just the one who
 placed it.
 
-**Which clock.** `expires_at` is compared against `env.ledger().timestamp()`
+#### Which clock
+
+`expires_at` is compared against `env.ledger().timestamp()`
 — Stellar's ledger close time in seconds, agreed by SCP consensus and
 required to be monotonic, not a value any single validator picks. The
 manipulation surface is small and points the harmless way: nudging the clock
@@ -273,19 +340,50 @@ ledger sequence (which the upgrade timelocks use) because a pause duration is
 negotiated between humans mid-incident — "give us six hours" — and seconds say
 that directly.
 
-**Hot-path cost.** Measured with the SDK's budget metering (see
-`contracts/escrow/src/test.rs`, "hot-path cost"). In normal operation — no
-pause ever set, which is the state the contracts are in essentially always —
-the guard costs **~168 CPU instructions**, against ~336,000 for a full
-`create_appointment`. A live pause record raises that to ~25,000, paid only
-*while an incident is in progress*. A call rejected by the guard costs about
-23% of the successful call it replaces, because the guard is the first
-statement of each entrypoint, ahead of auth and any other storage access — a
-pause is a usable response to an entrypoint being hammered, not an amplifier.
-No micro-optimization is warranted at these numbers: the guard is one
-instance-storage read plus two integer comparisons, on an entry that most
-invocations already have in their footprint. (Native-test metering
-underestimates compiled Wasm; treat the figures as relative, not as fees.)
+#### Hot-path cost
+
+The guard runs on every guarded entrypoint, so its cost is measured rather
+than assumed, using the SDK's budget metering. Tests live in
+`contracts/escrow/src/test.rs` under "hot-path cost".
+
+| Measurement | CPU instructions | Δ |
+|---|---:|---:|
+| Trivial instance-storage view (`get_storage_version`) — the floor | 51,549 | — |
+| `paused_scopes()`, **no pause record** | 51,717 | **+168** |
+| `paused_scopes()`, live pause record | 77,023 | +25,474 |
+| `create_appointment`, **no pause record** | 336,299 | — |
+| `create_appointment`, live record on another scope | 365,219 | +8.6% |
+| `create_appointment` rejected while paused | 78,216 | 23% of the above |
+
+> ⚠️ **These are SDK-test-metered numbers, not absolute Wasm costs or fees.**
+> Per the SDK's own documentation, native Rust test execution underestimates
+> both CPU and memory relative to the compiled Wasm, and this harness charges
+> no Wasm instantiation. They are meaningful as a *relative* comparison of
+> the same call with and without a pause record — which is the question being
+> asked — and should not be used to size a transaction fee.
+
+The shape that matters: **in normal operation — no pause ever set, which is
+the state the contracts are in essentially always — the guard costs ~168
+instructions against a ~336,000-instruction booking.** That is a rounding
+error. The ~25,000 figure is deserializing the `PauseState` record, and is
+paid only *while an incident is in progress*, which is precisely when
+degraded throughput is the point. It is also why `reason` is length-capped:
+the cap is what keeps the incident-time cost bounded too.
+
+A rejected call costs about 23% of the work it replaces, because the guard is
+the first statement of each guarded entrypoint, ahead of auth and every other
+storage access. That makes a pause a usable response to an entrypoint being
+hammered rather than an amplifier.
+
+No micro-optimization is warranted at these numbers. The guard is one
+instance-storage read plus two integer comparisons, and the instance entry is
+already in the footprint of any invocation that touches admin or governance
+state — so it is a hit on an entry the host has loaded regardless, not an
+extra ledger read. The tests fence *relative* behaviour (a deliberately loose
+"must not approach doubling") rather than absolute numbers, so an SDK bump
+doesn't produce a brittle CI failure.
+
+#### Pausing from the CLI
 
 ```sh
 # Halt new bookings for 6 hours (any one governance signer)

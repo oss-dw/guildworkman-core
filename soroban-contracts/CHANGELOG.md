@@ -44,9 +44,13 @@ sections start once something ships.
     monitoring. Auto-expiry emits nothing — it has no transaction behind it
     — so `Paused.expires_at` is the authoritative end of a window unless an
     `Unpaused` arrives sooner.
-  - A length-capped operator `reason` (≤ 64 bytes, may be empty) stored with
-    the pause and emitted with the event, so "why is this halted?" is
-    answerable from chain state.
+  - A length-capped operator `reason` (≤ 64 UTF-8 **bytes**, not characters;
+    may be empty) stored with the pause and emitted with the event, so "why
+    is this halted?" is answerable from chain state. Client-side validation
+    must count bytes.
+  - Event wire format is pinned by assertion, not just documented: topics are
+    `[Symbol("gov_pause"), Symbol("paused"|"unpaused"), Address(caller)]` and
+    data is a `Map<Symbol, Val>` keyed by field name.
   - New errors per contract: `OperationPaused` (deliberately distinct from
     any status error), `InvalidPauseScope`, `InvalidPauseDuration`,
     `NotPaused`, `InvalidPauseReason` — appended so no existing code moved.
@@ -65,8 +69,11 @@ sections start once something ships.
 
 - Measured guard overhead on the hot path: ~168 CPU instructions when no
   pause has been set (against ~336k for a full `create_appointment`), rising
-  to ~25k only while a pause record actually exists. Numbers and their
-  caveats are in `contracts/escrow/src/test.rs` under "hot-path cost".
+  to ~25k only while a pause record actually exists. Full table in
+  [README.md](README.md#hot-path-cost); tests in
+  `contracts/escrow/src/test.rs` under "hot-path cost". Numbers are
+  SDK-test-metered and underestimate compiled Wasm — they are a relative
+  comparison, not a fee estimate.
 
 ## Before this changelog
 

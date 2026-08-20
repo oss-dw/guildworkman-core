@@ -232,7 +232,16 @@ pub const SCOPE_ATTESTATION: u32 = 1 << 2;
 /// future-versioned scope fails loudly instead of silently pausing nothing.
 pub const ALL_SCOPES: u32 = SCOPE_INTAKE | SCOPE_SETTLEMENT | SCOPE_ATTESTATION;
 
-/// Longest `reason` a [`pause`] call may carry, in bytes.
+/// Longest `reason` a [`pause`] call may carry, measured in **UTF-8 bytes**
+/// — not characters.
+///
+/// The distinction is invisible for ASCII and load-bearing for everything
+/// else: `String::len()` reports bytes, so a 33-character reason made of
+/// two-byte code points is 66 bytes and is rejected, even though a
+/// character-count check would have passed it. A client validating this
+/// before submitting must count bytes (`Buffer.byteLength(s, 'utf8')` in
+/// JS, `len(s.encode('utf-8'))` in Python) or restrict itself to ASCII.
+/// Both boundaries are pinned by tests.
 ///
 /// Bounded because the reason is written to instance storage, which every
 /// subsequent invocation of the contract pays to load — an unbounded
@@ -278,16 +287,26 @@ pub struct PauseState {
     /// `expires_at` this makes the chosen duration recoverable from state
     /// alone, without correlating against the emitting transaction.
     pub paused_at: u64,
-    /// Free-form operator context, at most [`MAX_PAUSE_REASON_LEN`] bytes;
-    /// may be empty. Carries no meaning to the contract — it is never
-    /// parsed or compared — and exists so an on-call responder can answer
-    /// "why is this halted?" from chain state alone, rather than from a
-    /// chat log nobody can find at 3am.
+    /// Free-form operator context, at most [`MAX_PAUSE_REASON_LEN`] UTF-8
+    /// *bytes* (not characters); may be empty. Carries no meaning to the
+    /// contract — it is never parsed or compared — and exists so an on-call
+    /// responder can answer "why is this halted?" from chain state alone,
+    /// rather than from a chat log nobody can find at 3am.
     pub reason: String,
 }
 
-/// Emitted whenever a pause is placed or replaced. Topics:
-/// `["gov_pause", "paused", caller]`.
+/// Emitted whenever a pause is placed or replaced.
+///
+/// Wire format, as consumed by an off-chain indexer — pinned by
+/// `paused_event_has_the_documented_topics_and_data_shape` in the escrow
+/// test suite, so it cannot drift from this comment silently:
+///
+/// * **Topics** (ordered): `Symbol("gov_pause")`, `Symbol("paused")`,
+///   `Address(caller)`. The two prefix symbols come first, then each
+///   `#[topic]` field in declaration order.
+/// * **Data**: a `Map<Symbol, Val>` keyed by field name — `expires_at`
+///   (`u64`), `reason` (`String`), `scopes` (`u32`). Because it is a map,
+///   field *names* are part of the contract but their order is not.
 ///
 /// `expires_at` is the absolute ledger timestamp the pause lapses at, not a
 /// duration, so a monitor that missed the transaction can still tell how
@@ -305,8 +324,15 @@ pub struct Paused {
     pub reason: String,
 }
 
-/// Emitted when scopes are cleared early by a signer. Topics:
-/// `["gov_pause", "unpaused", caller]`.
+/// Emitted when scopes are cleared early by a signer.
+///
+/// Wire format, pinned by
+/// `unpaused_event_has_the_documented_topics_and_data_shape`:
+///
+/// * **Topics** (ordered): `Symbol("gov_pause")`, `Symbol("unpaused")`,
+///   `Address(caller)`.
+/// * **Data**: a `Map<Symbol, Val>` keyed by field name — `scopes` (`u32`),
+///   `remaining_scopes` (`u32`).
 ///
 /// Deliberately *not* emitted on auto-expiry: expiry is a read-time
 /// evaluation with no transaction behind it, so there is no execution
@@ -348,8 +374,10 @@ fn validate_scopes(scopes: u32) -> Result<(), GovernanceError> {
 /// the clock.
 ///
 /// `reason` is free-form operator context of at most
-/// [`MAX_PAUSE_REASON_LEN`] bytes, and may be empty. It is stored and
-/// emitted verbatim, never interpreted.
+/// [`MAX_PAUSE_REASON_LEN`] **UTF-8 bytes** — not characters, see that
+/// constant — and may be empty. It is stored and emitted verbatim, never
+/// interpreted. Over-length fails with
+/// [`GovernanceError::InvalidPauseReason`] before anything is written.
 ///
 /// Fails with [`GovernanceError::InvalidPauseDuration`] for a zero duration
 /// or one exceeding [`MAX_PAUSE_DURATION`] — the cap is enforced here, at

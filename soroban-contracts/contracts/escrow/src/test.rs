@@ -1283,3 +1283,108 @@ fn a_scope_escrow_has_no_entrypoints_for_is_a_well_formed_no_op() {
     ctx.contract.confirm_completion(&1);
     assert_eq!(ctx.token_client.balance(&ctx.worker), 10_000);
 }
+
+// ===========================================================================
+// Circuit breaker — event wire format
+// ===========================================================================
+//
+// Off-chain indexers key off the exact topic ordering and data shape, so
+// these are pinned by assertion rather than described in prose and hoped
+// for. The README's "Events" table is generated from what these assert; if
+// you change one, change both.
+
+#[test]
+fn paused_event_has_the_documented_topics_and_data_shape() {
+    use soroban_sdk::{map, testutils::Events as _, vec, IntoVal, Map, Symbol, Val};
+
+    let ctx = setup();
+    let signer = ctx.signers.get_unchecked(1);
+    let why = soroban_sdk::String::from_str(&ctx.env, "INC-412");
+    set_time(&ctx.env, 1_000);
+    ctx.contract.pause(&signer, &SCOPE_INTAKE, &7_200, &why);
+
+    // Prefix topics first, in declaration order, then the `#[topic]`
+    // fields — here just `caller`.
+    let topics: Vec<Val> = (
+        Symbol::new(&ctx.env, "gov_pause"),
+        Symbol::new(&ctx.env, "paused"),
+        signer.clone(),
+    )
+        .into_val(&ctx.env);
+
+    // Non-topic fields become a map keyed by field name (`data_format`
+    // defaults to "map"), so field *order* is not part of the contract but
+    // field *names* are.
+    let data: Map<Symbol, Val> = map![
+        &ctx.env,
+        (
+            Symbol::new(&ctx.env, "expires_at"),
+            8_200u64.into_val(&ctx.env)
+        ),
+        (Symbol::new(&ctx.env, "reason"), why.into_val(&ctx.env)),
+        (
+            Symbol::new(&ctx.env, "scopes"),
+            SCOPE_INTAKE.into_val(&ctx.env)
+        ),
+    ];
+
+    assert_eq!(
+        ctx.env.events().all(),
+        vec![
+            &ctx.env,
+            (
+                ctx.contract.address.clone(),
+                topics,
+                data.into_val(&ctx.env)
+            )
+        ]
+    );
+}
+
+#[test]
+fn unpaused_event_has_the_documented_topics_and_data_shape() {
+    use soroban_sdk::{map, testutils::Events as _, vec, IntoVal, Map, Symbol, Val};
+
+    let ctx = setup();
+    let signer = ctx.signers.get_unchecked(2);
+    set_time(&ctx.env, 1_000);
+    ctx.contract.pause(
+        &ctx.signers.get_unchecked(0),
+        &ALL_SCOPES,
+        &3_600,
+        &reason(&ctx.contract.env),
+    );
+    ctx.contract.unpause(&signer, &SCOPE_INTAKE);
+
+    let topics: Vec<Val> = (
+        Symbol::new(&ctx.env, "gov_pause"),
+        Symbol::new(&ctx.env, "unpaused"),
+        signer.clone(),
+    )
+        .into_val(&ctx.env);
+
+    let remaining: u32 = SCOPE_SETTLEMENT | governance::SCOPE_ATTESTATION;
+    let data: Map<Symbol, Val> = map![
+        &ctx.env,
+        (
+            Symbol::new(&ctx.env, "remaining_scopes"),
+            remaining.into_val(&ctx.env)
+        ),
+        (
+            Symbol::new(&ctx.env, "scopes"),
+            SCOPE_INTAKE.into_val(&ctx.env)
+        ),
+    ];
+
+    assert_eq!(
+        ctx.env.events().all(),
+        vec![
+            &ctx.env,
+            (
+                ctx.contract.address.clone(),
+                topics,
+                data.into_val(&ctx.env)
+            )
+        ]
+    );
+}

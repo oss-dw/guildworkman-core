@@ -718,3 +718,51 @@ fn repeated_guard_consultations_within_one_ledger_all_agree() {
         assert_eq!(paused_scopes(&ctx.env), 0);
     });
 }
+
+// ---------------------------------------------------------------------------
+// The reason cap is bytes, not characters
+// ---------------------------------------------------------------------------
+//
+// `MAX_PAUSE_REASON_LEN` bounds the UTF-8 *byte* length, because that is what
+// the storage entry actually costs and what `String::len()` reports. For
+// ASCII the distinction is invisible, which is exactly why it needs pinning:
+// a client that validates character count would happily submit a reason the
+// contract rejects. These two tests are the executable statement of that.
+
+/// 32 × U+00E9, two bytes each: 32 characters, exactly 64 bytes.
+const REASON_32_CHARS_64_BYTES: &str = "éééééééééééééééééééééééééééééééé";
+
+/// 33 × U+00E9: 33 characters — comfortably under a 64-*character* limit —
+/// but 66 bytes, which is over the cap.
+const REASON_33_CHARS_66_BYTES: &str = "ééééééééééééééééééééééééééééééééé";
+
+#[test]
+fn a_multibyte_reason_is_measured_in_bytes_and_accepted_at_exactly_the_cap() {
+    let ctx = setup();
+    let state = ctx
+        .pause_with_reason(ctx.signer(0), SCOPE_INTAKE, 3_600, REASON_32_CHARS_64_BYTES)
+        .unwrap();
+
+    // The contract counts bytes: 32 characters weighing 64 bytes is exactly
+    // at the cap, not half of it.
+    assert_eq!(state.reason.len(), MAX_PAUSE_REASON_LEN);
+    assert_eq!(REASON_32_CHARS_64_BYTES.chars().count(), 32);
+    assert_eq!(REASON_32_CHARS_64_BYTES.len() as u32, MAX_PAUSE_REASON_LEN);
+}
+
+#[test]
+fn a_multibyte_reason_over_the_byte_cap_is_rejected_despite_a_short_char_count() {
+    let ctx = setup();
+
+    assert_eq!(
+        ctx.pause_with_reason(ctx.signer(0), SCOPE_INTAKE, 3_600, REASON_33_CHARS_66_BYTES),
+        Err(GovernanceError::InvalidPauseReason)
+    );
+    // 33 characters would pass any character-count check; 66 bytes does not.
+    assert_eq!(REASON_33_CHARS_66_BYTES.chars().count(), 33);
+    assert_eq!(
+        REASON_33_CHARS_66_BYTES.len() as u32,
+        MAX_PAUSE_REASON_LEN + 2
+    );
+    assert_eq!(ctx.scopes(), 0);
+}
