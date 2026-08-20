@@ -24,6 +24,7 @@ holding money, recording reviews, issuing rewards — on-chain.
 - [Project ecosystem](#project-ecosystem)
 - [Architecture](#architecture)
 - [Upgrade governance](#upgrade-governance)
+- [Emergency circuit breaker](#emergency-circuit-breaker)
 - [Prerequisites](#prerequisites)
 - [Build](#build)
 - [Test](#test)
@@ -137,6 +138,136 @@ variants it inherited from `governance-guard`, at whatever numeric offset
 came next in that contract's existing `Error` enum — the variant names are
 identical across all four, only the numbers differ.
 
+## Emergency circuit breaker
+
+The same four contracts can be **paused** during an incident. The primitive
+lives in `contracts/governance-guard`'s `pausable` module, next to the
+upgrade guard and for the same reason: every contract that needs it already
+depends on that crate.
+
+A plain `bool paused` flag would be a rug pull waiting to happen, so this one
+is built around three properties instead.
+
+**1. Scoped, not global.** A pause names a bitmask of scopes rather than
+freezing the contract:
+
+| Scope | Bit | Meaning | Guarded entrypoints |
+|---|---|---|---|
+| `SCOPE_INTAKE` | `1` | New value or new obligations entering the system | `escrow`: `create_appointment`, `create_milestone_escrow`, `add_milestone` · `loyalty-token`: `mint` · `loyalty-emissions`: `create_schedule` |
+| `SCOPE_SETTLEMENT` | `2` | Discretionary happy-path payouts | `escrow`: `confirm_completion`, `approve_milestone`, `release_milestone_funds` · `loyalty-emissions`: `claim` |
+| `SCOPE_ATTESTATION` | `4` | Reputation writes | `reputation`: `submit_attestation` |
+
+`ALL_SCOPES` (`7`) is all three. A contract with no entrypoint in some scope
+ignores a pause naming it — pausing `SCOPE_ATTESTATION` on `escrow` is a
+well-formed no-op, not an error, so an operator can broadcast one mask to
+every contract without special-casing.
+
+**2. Fund-recovery paths are never guarded.** This is the constraint the
+whole design exists to satisfy, and it is enforced by *omission* — the
+following entrypoints carry no pause check at all, so no scope value,
+`ALL_SCOPES` included, can reach them:
+
+| Contract | Always callable, even while paused | Why |
+|---|---|---|
+| `escrow` | `cancel_appointment`, `raise_dispute`, `resolve_dispute`, `raise_milestone_dispute`, `resolve_milestone_dispute` | Every route by which an escrowed balance reaches whoever is entitled to it. Pausing intake stops new money entering; pausing a refund would create a hostage situation. |
+| `loyalty-token` | `transfer`, `transfer_from`, `approve`, `burn` | These move *already-held* balances. A holder's points are their property; only `mint` — the sole path that creates supply that doesn't yet exist — is guarded. |
+| `loyalty-emissions` | `reclaim` | Mints and burns nothing; it only marks an allocation as never-to-be-minted, so it can't take a balance anyone holds. |
+| all | every read-only view | A consumer must always be able to see current state, including the state that prompted the halt. |
+
+Pausing `SCOPE_SETTLEMENT` does withhold a payout, which deserves an explicit
+argument rather than an assumption. It is a delay, not a seizure: it changes
+no party's power relative to the others (a client could always cancel a
+`Funded` appointment; either party could always force a dispute — both stay
+open), and `release_milestone_funds` is *permissionless*, which is exactly
+why it has to be haltable. On `loyalty-emissions`, vesting is a pure function
+of the ledger clock and keeps accruing through a pause, so a halted `claim`
+mints the identical amount afterwards, just later.
+
+**3. Time-bound, enforced on read.** A pause carries an `expires_at` ledger
+timestamp, capped at `MAX_PAUSE_DURATION` (7 days). Expiry is evaluated every
+time a guard is consulted, so a pause lapses with **no unpause transaction,
+no live admin and no working key** — an abandoned pause is indistinguishable
+from no pause at all.
+
+What this deliberately does *not* promise: an admin who is present and
+hostile can re-pause each time the window lapses. That is not closable here —
+the same signer set can already replace all of a contract's code through the
+upgrade flow. The honest guarantee is narrower: *an unattended pause always
+clears*, and *no pause of any duration can stop a user from recovering funds
+they already own*. The second half is what keeps the residual risk a liveness
+problem for new business rather than a custody problem for existing balances.
+
+**Authorization.** `pause` and `unpause` require **any single governance
+signer** — not the full M-of-N threshold, and deliberately not each
+contract's own `admin`. Gathering a threshold takes time an incident doesn't
+give you, and the action being authorized is bounded on every axis that
+matters, so this mirrors `cancel_upgrade`, which is unilateral for the same
+reason. Using the signer set rather than `admin` matters because the signer
+set is M-of-N, is rotatable through the timelocked flow, and survives the
+loss of any one key — an incident is exactly when a single non-rotatable key
+is least trustworthy. `unpause` is unilateral in the same way, so a responder
+who places a pause and then goes offline cannot wedge it in place.
+
+**Entrypoints**, added to all four contracts:
+
+- `pause(caller: Address, scopes: u32, duration_secs: u64) -> PauseState`
+- `unpause(caller: Address, scopes: u32) -> u32` — clears only the named
+  scopes and returns what's still halted, *without* touching the deadline.
+  Re-calling `pause` with a narrower mask would also lift scopes, but restarts
+  the clock on everything left; partial `unpause` is how you bring the system
+  back a piece at a time.
+- `get_pause_state() -> Option<PauseState>` — `None` once expired
+- `paused_scopes() -> u32`, `is_paused(scope: u32) -> bool`
+
+Two events let off-chain monitoring react: `Paused { caller, scopes,
+expires_at }` (topics `["gov_pause", "paused", caller]`) and `Unpaused {
+caller, scopes, remaining_scopes }` (topics `["gov_pause", "unpaused",
+caller]`). Auto-expiry emits nothing — it is a read-time evaluation with no
+transaction behind it, so monitors should treat the `expires_at` carried by
+`Paused` as the authoritative end of the window unless an `Unpaused` arrives
+sooner.
+
+**Errors.** Four variants per contract, at whatever offset came next in that
+contract's existing `Error` enum — identical names, different numbers:
+
+| Variant | `escrow` | `reputation` | `loyalty-token` | `loyalty-emissions` | Meaning |
+|---|---|---|---|---|---|
+| `OperationPaused` | 37 | 29 | 24 | 30 | The entrypoint's scope is currently halted. A dedicated variant rather than a reused `InvalidStatus`: "the protocol is halted, retry later" and "this request was never valid" call for opposite reactions from a client. |
+| `InvalidPauseScope` | 38 | 30 | 25 | 31 | The scope mask was empty or contained bits outside `ALL_SCOPES`. Empty is rejected rather than treated as a no-op — during an incident a mask that halts nothing is a mistake the operator wants to hear about. |
+| `InvalidPauseDuration` | 39 | 31 | 26 | 32 | The duration was `0` or exceeded `MAX_PAUSE_DURATION`. |
+| `NotPaused` | 40 | 32 | 27 | 33 | `unpause` with nothing in effect, including a record that already auto-expired. |
+
+A non-signer calling `pause`/`unpause` gets the existing `NotASigner`.
+
+**Storage.** One instance-storage entry, `GovernanceDataKey::PauseState`,
+holding `PauseState { scopes, expires_at, paused_by, paused_at }`. Appended
+after `PendingRotation` so already-deployed contracts' key encodings stay
+put. Only one record exists at a time — a second `pause` replaces the first
+outright rather than layering — so the halted scopes and the deadline are
+always readable from one place.
+
+```sh
+# Halt new bookings for 6 hours (any one governance signer)
+stellar contract invoke --id $ESCROW --source signer1 --network testnet \
+  -- pause --caller $SIGNER_1 --scopes 1 --duration_secs 21600
+
+# Halt everything the breaker can reach, for the 7-day maximum
+stellar contract invoke --id $ESCROW --source signer1 --network testnet \
+  -- pause --caller $SIGNER_1 --scopes 7 --duration_secs 604800
+
+# Refunds and disputes keep working throughout — no scope reaches them
+stellar contract invoke --id $ESCROW --source client --network testnet \
+  -- cancel_appointment --appointment_id 1
+
+# Bring intake back early, leaving settlement halted
+stellar contract invoke --id $ESCROW --source signer2 --network testnet \
+  -- unpause --caller $SIGNER_2 --scopes 1
+
+# What's halted right now, and until when
+stellar contract invoke --id $ESCROW --source signer1 --network testnet \
+  -- get_pause_state
+```
+
 ## Prerequisites
 
 - Rust with the `wasm32v1-none` target: `rustup target add wasm32v1-none`
@@ -245,6 +376,7 @@ stellar contract invoke --id $LOYALTY --source admin --network testnet \
 - `resolve_dispute(appointment_id: u64, refund_to_client: bool)` — admin-only
 - `get_appointment(appointment_id: u64) -> Appointment`
 - `propose_upgrade`, `approve_upgrade`, `cancel_upgrade`, `migrate`, `get_signers`, `get_upgrade_threshold`, `get_pending_upgrade`, `get_storage_version` — see [Upgrade governance](#upgrade-governance)
+- `pause`, `unpause`, `get_pause_state`, `paused_scopes`, `is_paused` — see [Emergency circuit breaker](#emergency-circuit-breaker)
 
 #### Storage layout
 
@@ -275,6 +407,10 @@ stellar contract invoke --id $LOYALTY --source admin --network testnet \
 | `HashMismatch` | 16 | `approve_upgrade` with a hash that doesn't match the pending proposal. |
 | `AlreadyMigrated` | 17 | `migrate` targeting a version already applied or behind the current one. |
 | `NothingToMigrate` | 18 | `migrate` called when the stored version is already current. |
+
+Codes 19-36 (milestone escrow and signer rotation) are documented in
+`src/lib.rs`; codes 37-40 are the circuit breaker's, listed in
+[Emergency circuit breaker](#emergency-circuit-breaker).
 
 #### CLI usage
 
@@ -322,8 +458,10 @@ stellar contract invoke --id $ESCROW --source admin --network testnet \
 > of this PR: `initialize` now also takes a `governance_init: GovernanceInit`,
 > and the contract has the same `propose_upgrade`/`approve_upgrade`/
 > `cancel_upgrade`/`migrate` surface described in
-> [Upgrade governance](#upgrade-governance) — see the source and
-> `src/test.rs` for the actual current interface.
+> [Upgrade governance](#upgrade-governance), plus the `pause`/`unpause`
+> surface described in
+> [Emergency circuit breaker](#emergency-circuit-breaker) — see the source
+> and `src/test.rs` for the actual current interface.
 
 - `submit_review(appointment_id: u64, client: Address, worker: Address, rating: u32, comment: String)` — 1-5 stars, one review per `appointment_id`
 - `get_rating(worker: Address) -> Rating { count, sum }`
@@ -375,6 +513,7 @@ stellar contract invoke --id $REPUTATION --source admin --network testnet \
 - `mint(to: Address, amount: i128)` — minter-only
 - `transfer`, `transfer_from`, `approve`, `allowance`, `burn`, `balance`, `decimals`, `name`, `symbol` — standard SEP-41 token surface
 - `propose_upgrade`, `approve_upgrade`, `cancel_upgrade`, `migrate`, `get_signers`, `get_upgrade_threshold`, `get_pending_upgrade`, `get_storage_version` — see [Upgrade governance](#upgrade-governance)
+- `pause`, `unpause`, `get_pause_state`, `paused_scopes`, `is_paused` — see [Emergency circuit breaker](#emergency-circuit-breaker)
 
 #### Storage layout
 
@@ -407,6 +546,10 @@ stellar contract invoke --id $REPUTATION --source admin --network testnet \
 | `HashMismatch` | 15 | `approve_upgrade` with a hash that doesn't match the pending proposal. |
 | `AlreadyMigrated` | 16 | `migrate` targeting a version already applied or behind the current one. |
 | `NothingToMigrate` | 17 | `migrate` called when the stored version is already current. |
+
+Codes 18-23 (signer rotation) are documented in `src/lib.rs`; codes 24-27 are
+the circuit breaker's, listed in
+[Emergency circuit breaker](#emergency-circuit-breaker).
 
 #### CLI usage
 
@@ -469,6 +612,7 @@ allocations left unclaimed past a deadline.
   `get_schedule(beneficiary) -> Schedule`, `get_config() -> Config`,
   `get_admin() -> Address`, `get_token() -> Address` — read-only views
 - `propose_upgrade`, `approve_upgrade`, `cancel_upgrade`, `migrate`, `get_signers`, `get_upgrade_threshold`, `get_pending_upgrade`, `get_storage_version` — see [Upgrade governance](#upgrade-governance)
+- `pause`, `unpause`, `get_pause_state`, `paused_scopes`, `is_paused` — see [Emergency circuit breaker](#emergency-circuit-breaker)
 
 #### Vesting & rate-limit model
 
@@ -523,6 +667,10 @@ the admin can never reclaim allocations that are still vesting.
 | `HashMismatch` | 21 | `approve_upgrade` with a hash that doesn't match the pending proposal. |
 | `AlreadyMigrated` | 22 | `migrate` targeting a version already applied or behind the current one. |
 | `NothingToMigrate` | 23 | `migrate` called when the stored version is already current. |
+
+Codes 24-29 (signer rotation) are documented in `src/lib.rs`; codes 30-33 are
+the circuit breaker's, listed in
+[Emergency circuit breaker](#emergency-circuit-breaker).
 
 #### Authorization & safety notes
 
@@ -716,12 +864,17 @@ stellar contract invoke --id $DISPUTES --source juror --network testnet \
   (that responsibility sits with whatever system calls `create_appointment`
   and `submit_review` with real appointment IDs — today, nothing does, since
   the Java backend isn't integrated yet).
-- **Upgrade path exists; pause does not.** All four contracts have a
-  multi-sig-gated code-upgrade and storage-migration path (see
-  [Upgrade governance](#upgrade-governance)) — fixing a deployed bug no
-  longer requires deploying a new contract and migrating callers manually.
-  There's still no emergency pause switch, and the governance signer set is
-  fixed at `initialize` with no rotation flow yet.
+- **A pause is a liveness risk, not a custody risk — by construction.** All
+  four contracts can now be halted per-scope (see
+  [Emergency circuit breaker](#emergency-circuit-breaker)), and any *single*
+  governance signer can do it. Be clear about what that buys an attacker who
+  compromises one key: they can block new bookings, payouts and attestations
+  for up to 7 days per call, and can re-arm each time a window lapses. They
+  cannot touch a balance that already exists — refunds, disputes and token
+  transfers of held balances carry no pause check at all — and they cannot
+  make a halt outlive their own presence, because expiry is evaluated on
+  every read. Sizing `MAX_PAUSE_DURATION` is the knob that trades response
+  headroom against that griefing window.
 - **The upgrade path's actual Wasm swap is untested by `cargo test`.**
   `propose_upgrade`/`approve_upgrade` crossing the configured threshold
   calls `update_current_contract_wasm`, which requires the target hash to
