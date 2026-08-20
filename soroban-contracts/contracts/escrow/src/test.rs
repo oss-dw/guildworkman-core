@@ -790,6 +790,13 @@ fn get_milestone_not_found_returns_error() {
 // intake and settlement entrypoints are guarded, and — the property the whole
 // design rests on — that every fund-recovery entrypoint is *not*.
 
+/// Reason string for tests that don't exercise the field itself. Kept
+/// non-empty so the round-trip through storage is actually covered by every
+/// pause test rather than only the ones that look at it.
+fn reason(env: &Env) -> soroban_sdk::String {
+    soroban_sdk::String::from_str(env, "INC-000 test")
+}
+
 fn set_time(env: &Env, timestamp: u64) {
     env.ledger().with_mut(|l| l.timestamp = timestamp);
 }
@@ -798,8 +805,12 @@ fn set_time(env: &Env, timestamp: u64) {
 /// "before" and "after the deadline" are both expressible.
 fn pause_everything(ctx: &TestCtx) -> u64 {
     set_time(&ctx.env, 1_000);
-    ctx.contract
-        .pause(&ctx.signers.get_unchecked(0), &ALL_SCOPES, &3_600);
+    ctx.contract.pause(
+        &ctx.signers.get_unchecked(0),
+        &ALL_SCOPES,
+        &3_600,
+        &reason(&ctx.contract.env),
+    );
     1_000
 }
 
@@ -828,8 +839,12 @@ fn paused_intake_blocks_new_milestone_escrows_and_milestones() {
         .create_milestone_escrow(&1, &milestone_escrow_init(&ctx));
 
     set_time(&ctx.env, 1_000);
-    ctx.contract
-        .pause(&ctx.signers.get_unchecked(0), &SCOPE_INTAKE, &3_600);
+    ctx.contract.pause(
+        &ctx.signers.get_unchecked(0),
+        &SCOPE_INTAKE,
+        &3_600,
+        &reason(&ctx.contract.env),
+    );
 
     let res = ctx
         .contract
@@ -908,8 +923,12 @@ fn pausing_intake_alone_leaves_settlement_working() {
         .create_appointment(&1, &ctx.client, &ctx.worker, &ctx.token, &10_000);
 
     set_time(&ctx.env, 1_000);
-    ctx.contract
-        .pause(&ctx.signers.get_unchecked(0), &SCOPE_INTAKE, &3_600);
+    ctx.contract.pause(
+        &ctx.signers.get_unchecked(0),
+        &SCOPE_INTAKE,
+        &3_600,
+        &reason(&ctx.contract.env),
+    );
 
     // Existing business settles normally; only new business is halted.
     ctx.contract.confirm_completion(&1);
@@ -923,8 +942,12 @@ fn pausing_settlement_alone_blocks_payout_but_not_new_appointments() {
         .create_appointment(&1, &ctx.client, &ctx.worker, &ctx.token, &10_000);
 
     set_time(&ctx.env, 1_000);
-    ctx.contract
-        .pause(&ctx.signers.get_unchecked(0), &SCOPE_SETTLEMENT, &3_600);
+    ctx.contract.pause(
+        &ctx.signers.get_unchecked(0),
+        &SCOPE_SETTLEMENT,
+        &3_600,
+        &reason(&ctx.contract.env),
+    );
 
     let res = ctx.contract.try_confirm_completion(&1);
     assert_eq!(res, Err(Ok(Error::OperationPaused)));
@@ -947,8 +970,12 @@ fn paused_settlement_blocks_milestone_approval_and_release() {
     set_ledger(&ctx.env, 201);
 
     set_time(&ctx.env, 1_000);
-    ctx.contract
-        .pause(&ctx.signers.get_unchecked(0), &SCOPE_SETTLEMENT, &3_600);
+    ctx.contract.pause(
+        &ctx.signers.get_unchecked(0),
+        &SCOPE_SETTLEMENT,
+        &3_600,
+        &reason(&ctx.contract.env),
+    );
 
     // The permissionless release is exactly what the scope exists to stop.
     let res = ctx.contract.try_release_milestone_funds(&1, &0);
@@ -990,6 +1017,7 @@ fn a_pause_longer_than_the_cap_is_refused_outright() {
         &ctx.signers.get_unchecked(0),
         &ALL_SCOPES,
         &(MAX_PAUSE_DURATION + 1),
+        &reason(&ctx.contract.env),
     );
     assert_eq!(res, Err(Ok(Error::InvalidPauseDuration)));
     assert_eq!(ctx.contract.paused_scopes(), 0);
@@ -1002,7 +1030,9 @@ fn a_non_signer_cannot_pause_the_escrow() {
     let ctx = setup();
     let outsider = Address::generate(&ctx.env);
 
-    let res = ctx.contract.try_pause(&outsider, &ALL_SCOPES, &3_600);
+    let res = ctx
+        .contract
+        .try_pause(&outsider, &ALL_SCOPES, &3_600, &reason(&ctx.contract.env));
     assert_eq!(res, Err(Ok(Error::NotASigner)));
     assert_eq!(ctx.contract.paused_scopes(), 0);
 
@@ -1017,7 +1047,9 @@ fn the_admin_arbiter_is_not_a_pause_authority() {
     // governance signer set instead. Pinning this down stops a later change
     // from quietly widening who can halt the protocol.
     let ctx = setup();
-    let res = ctx.contract.try_pause(&ctx.admin, &ALL_SCOPES, &3_600);
+    let res = ctx
+        .contract
+        .try_pause(&ctx.admin, &ALL_SCOPES, &3_600, &reason(&ctx.contract.env));
     assert_eq!(res, Err(Ok(Error::NotASigner)));
 }
 
@@ -1073,7 +1105,8 @@ fn pause_views_report_who_paused_and_until_when() {
     let ctx = setup();
     let signer = ctx.signers.get_unchecked(1);
     set_time(&ctx.env, 1_000);
-    ctx.contract.pause(&signer, &SCOPE_INTAKE, &7_200);
+    ctx.contract
+        .pause(&signer, &SCOPE_INTAKE, &7_200, &reason(&ctx.contract.env));
 
     let state = ctx.contract.get_pause_state().unwrap();
     assert_eq!(state.scopes, SCOPE_INTAKE);
@@ -1083,4 +1116,170 @@ fn pause_views_report_who_paused_and_until_when() {
 
     assert!(ctx.contract.is_paused(&SCOPE_INTAKE));
     assert!(!ctx.contract.is_paused(&SCOPE_SETTLEMENT));
+}
+
+// ===========================================================================
+// Circuit breaker — hot-path cost
+// ===========================================================================
+//
+// The guard runs on every guarded entrypoint, so its incremental cost is
+// measured rather than assumed. Two caveats, both from the SDK's own docs:
+// native Rust test execution underestimates CPU and memory relative to
+// compiled Wasm, and this harness charges no Wasm instantiation. These are
+// useful as *relative* comparisons between the same call with and without a
+// pause record — which is the question being asked — not as fee estimates.
+//
+// Measured here (CPU instructions, this harness, at the time of writing):
+//
+//   trivial instance-storage view (`get_storage_version`)   51,549
+//   `paused_scopes()`, no pause record                      51,717   (+168)
+//   `paused_scopes()`, live pause record                    77,023   (+25,474)
+//   `create_appointment`, no pause record                  336,299
+//   `create_appointment`, live record on another scope     365,219   (+8.6%)
+//   `create_appointment` rejected while paused              78,216   (23%)
+//
+// The shape that matters: **in normal operation — no pause ever set, which
+// is the state the contract is in essentially always — the guard costs on
+// the order of 168 instructions**, a rounding error against a 336k-
+// instruction booking. The ~25k figure is the deserialization of the
+// `PauseState` struct and is only paid *while an incident is in progress*,
+// when degraded throughput is the point. That is why the record is a single
+// instance-storage entry with a length-capped `reason` rather than anything
+// richer: the cap is what keeps the incident-time cost bounded too.
+//
+// No micro-optimization is warranted on these numbers. The guard is one
+// instance-storage read plus two integer comparisons, and the instance entry
+// is already in the footprint of any invocation that touches admin or
+// governance state.
+
+fn cpu_cost_of<F: FnOnce()>(env: &Env, f: F) -> u64 {
+    let mut budget = env.cost_estimate().budget();
+    budget.reset_default();
+    f();
+    env.cost_estimate().budget().cpu_instruction_cost()
+}
+
+#[test]
+fn the_guard_is_nearly_free_when_no_pause_has_ever_been_set() {
+    // The normal-operation path. Compared against a trivial view that also
+    // touches instance storage, so the delta isolates the guard rather than
+    // measuring invocation overhead.
+    let ctx = setup();
+    let trivial = cpu_cost_of(&ctx.env, || {
+        ctx.contract.get_storage_version();
+    });
+    let guard = cpu_cost_of(&ctx.env, || {
+        ctx.contract.paused_scopes();
+    });
+
+    assert!(guard >= trivial);
+    let overhead = guard - trivial;
+    assert!(
+        overhead < trivial / 10,
+        "guard overhead with no pause record should stay far below the cost \
+         of the invocation it sits in: {overhead} vs {trivial}"
+    );
+}
+
+#[test]
+fn guard_overhead_on_create_appointment_stays_bounded() {
+    // No pause record — what every call pays in normal operation.
+    let baseline_ctx = setup();
+    let baseline = cpu_cost_of(&baseline_ctx.env, || {
+        baseline_ctx.contract.create_appointment(
+            &1,
+            &baseline_ctx.client,
+            &baseline_ctx.worker,
+            &baseline_ctx.token,
+            &10_000,
+        );
+    });
+
+    // A live record covering a *different* scope: the guard loads and
+    // deserializes it on every call, the worst case for a call that still
+    // succeeds.
+    let loaded_ctx = setup();
+    set_time(&loaded_ctx.env, 1_000);
+    loaded_ctx.contract.pause(
+        &loaded_ctx.signers.get_unchecked(0),
+        &SCOPE_SETTLEMENT,
+        &3_600,
+        &reason(&loaded_ctx.contract.env),
+    );
+    let with_record = cpu_cost_of(&loaded_ctx.env, || {
+        loaded_ctx.contract.create_appointment(
+            &1,
+            &loaded_ctx.client,
+            &loaded_ctx.worker,
+            &loaded_ctx.token,
+            &10_000,
+        );
+    });
+
+    // A deliberately loose regression fence, not a claim about absolute
+    // cost: the guard is a storage read and two comparisons, so anything
+    // approaching a doubling means it stopped being that.
+    assert!(
+        with_record < baseline * 2,
+        "pause guard overhead grew unexpectedly: {baseline} -> {with_record} CPU insns"
+    );
+    assert!(baseline > 0 && with_record > 0);
+}
+
+#[test]
+fn a_paused_call_costs_less_than_a_successful_one() {
+    // The guard is the first statement of each guarded entrypoint, ahead of
+    // auth and any other storage access, so rejection is strictly cheaper
+    // than doing the work. That is what makes a pause a usable response to
+    // an entrypoint being hammered, rather than an amplifier.
+    let ctx = setup();
+    let allowed = cpu_cost_of(&ctx.env, || {
+        ctx.contract
+            .create_appointment(&1, &ctx.client, &ctx.worker, &ctx.token, &10_000);
+    });
+
+    set_time(&ctx.env, 1_000);
+    ctx.contract.pause(
+        &ctx.signers.get_unchecked(0),
+        &SCOPE_INTAKE,
+        &3_600,
+        &reason(&ctx.contract.env),
+    );
+    let rejected = cpu_cost_of(&ctx.env, || {
+        let res =
+            ctx.contract
+                .try_create_appointment(&2, &ctx.client, &ctx.worker, &ctx.token, &10_000);
+        assert_eq!(res, Err(Ok(Error::OperationPaused)));
+    });
+
+    assert!(
+        rejected < allowed,
+        "paused rejection ({rejected}) should cost less than the work it replaces ({allowed})"
+    );
+}
+
+// ===========================================================================
+// Circuit breaker — broadcast semantics
+// ===========================================================================
+
+#[test]
+fn a_scope_escrow_has_no_entrypoints_for_is_a_well_formed_no_op() {
+    // An operator sweeping every contract with one mask must not have to
+    // special-case which scopes a given contract implements.
+    let ctx = setup();
+    set_time(&ctx.env, 1_000);
+    ctx.contract.pause(
+        &ctx.signers.get_unchecked(0),
+        &governance::SCOPE_ATTESTATION,
+        &3_600,
+        &reason(&ctx.contract.env),
+    );
+
+    assert_eq!(ctx.contract.paused_scopes(), governance::SCOPE_ATTESTATION);
+    // Accepted and recorded, but escrow has no attestation entrypoint, so
+    // every one of its own paths stays open.
+    ctx.contract
+        .create_appointment(&1, &ctx.client, &ctx.worker, &ctx.token, &10_000);
+    ctx.contract.confirm_completion(&1);
+    assert_eq!(ctx.token_client.balance(&ctx.worker), 10_000);
 }

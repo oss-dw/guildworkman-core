@@ -53,15 +53,19 @@
 //! can therefore stop new money entering and delay a discretionary payout,
 //! but cannot strand money already held here — and it lapses on its own at
 //! `expires_at` with no admin transaction required.
+//!
+//! `pause` carries a length-capped operator `reason` recorded alongside the
+//! deadline, so `get_pause_state` answers "what is halted, until when, and
+//! why" in one read.
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, Vec,
+    contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, String, Vec,
 };
 
 use guildworkman_governance_guard as governance;
 pub use guildworkman_governance_guard::{
-    PauseState, PendingRotation, PendingUpgrade, ALL_SCOPES, MAX_PAUSE_DURATION, SCOPE_INTAKE,
-    SCOPE_SETTLEMENT,
+    PauseState, PendingRotation, PendingUpgrade, ALL_SCOPES, MAX_PAUSE_DURATION,
+    MAX_PAUSE_REASON_LEN, SCOPE_INTAKE, SCOPE_SETTLEMENT,
 };
 
 /// Bump when this contract's storage layout actually changes shape and
@@ -194,6 +198,7 @@ pub enum Error {
     InvalidPauseScope = 38,
     InvalidPauseDuration = 39,
     NotPaused = 40,
+    InvalidPauseReason = 41,
 }
 
 impl From<governance::GovernanceError> for Error {
@@ -219,6 +224,7 @@ impl From<governance::GovernanceError> for Error {
             governance::GovernanceError::InvalidPauseScope => Error::InvalidPauseScope,
             governance::GovernanceError::InvalidPauseDuration => Error::InvalidPauseDuration,
             governance::GovernanceError::NotPaused => Error::NotPaused,
+            governance::GovernanceError::InvalidPauseReason => Error::InvalidPauseReason,
         }
     }
 }
@@ -367,8 +373,9 @@ impl EscrowContract {
         caller: Address,
         scopes: u32,
         duration_secs: u64,
+        reason: String,
     ) -> Result<PauseState, Error> {
-        governance::pause(&env, caller, scopes, duration_secs).map_err(Into::into)
+        governance::pause(&env, caller, scopes, duration_secs, reason).map_err(Into::into)
     }
 
     /// Clears `scopes` from the active pause early. Returns the scopes still

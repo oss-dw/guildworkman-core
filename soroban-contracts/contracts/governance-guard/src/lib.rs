@@ -219,6 +219,8 @@ pub enum GovernanceError {
     /// `unpause` was called while nothing is in effect — either no pause
     /// was ever placed, or the one that was has already auto-expired.
     NotPaused = 20,
+    /// The `reason` passed to `pause` exceeded `MAX_PAUSE_REASON_LEN`.
+    InvalidPauseReason = 21,
 }
 
 /// How long a proposal stays open for approval before it must be
@@ -745,8 +747,8 @@ pub fn get_pending_rotation(env: &Env) -> Option<PendingRotation> {
 pub mod pausable;
 pub use pausable::{
     get_pause_state, is_paused, pause, paused_scopes, require_not_paused, unpause, PauseState,
-    Paused, Unpaused, ALL_SCOPES, MAX_PAUSE_DURATION, SCOPE_ATTESTATION, SCOPE_INTAKE,
-    SCOPE_SETTLEMENT,
+    Paused, Unpaused, ALL_SCOPES, MAX_PAUSE_DURATION, MAX_PAUSE_REASON_LEN, SCOPE_ATTESTATION,
+    SCOPE_INTAKE, SCOPE_SETTLEMENT,
 };
 
 #[cfg(test)]

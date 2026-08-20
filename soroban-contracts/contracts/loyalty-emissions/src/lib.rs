@@ -42,13 +42,14 @@
 //!   event draining emissions faster than intended.
 
 use soroban_sdk::{
-    contract, contractclient, contracterror, contractimpl, contracttype, Address, BytesN, Env, Vec,
+    contract, contractclient, contracterror, contractimpl, contracttype, Address, BytesN, Env,
+    String, Vec,
 };
 
 use guildworkman_governance_guard as governance;
 pub use guildworkman_governance_guard::{
-    PauseState, PendingRotation, PendingUpgrade, ALL_SCOPES, MAX_PAUSE_DURATION, SCOPE_INTAKE,
-    SCOPE_SETTLEMENT,
+    PauseState, PendingRotation, PendingUpgrade, ALL_SCOPES, MAX_PAUSE_DURATION,
+    MAX_PAUSE_REASON_LEN, SCOPE_INTAKE, SCOPE_SETTLEMENT,
 };
 
 /// Bump when this contract's storage layout actually changes shape and
@@ -159,6 +160,7 @@ pub enum Error {
     InvalidPauseScope = 31,
     InvalidPauseDuration = 32,
     NotPaused = 33,
+    InvalidPauseReason = 34,
 }
 
 impl From<governance::GovernanceError> for Error {
@@ -184,6 +186,7 @@ impl From<governance::GovernanceError> for Error {
             governance::GovernanceError::InvalidPauseScope => Error::InvalidPauseScope,
             governance::GovernanceError::InvalidPauseDuration => Error::InvalidPauseDuration,
             governance::GovernanceError::NotPaused => Error::NotPaused,
+            governance::GovernanceError::InvalidPauseReason => Error::InvalidPauseReason,
         }
     }
 }
@@ -346,8 +349,9 @@ impl LoyaltyEmissions {
         caller: Address,
         scopes: u32,
         duration_secs: u64,
+        reason: String,
     ) -> Result<PauseState, Error> {
-        governance::pause(&env, caller, scopes, duration_secs).map_err(Into::into)
+        governance::pause(&env, caller, scopes, duration_secs, reason).map_err(Into::into)
     }
 
     /// Clears `scopes` from the active pause early. Returns the scopes still

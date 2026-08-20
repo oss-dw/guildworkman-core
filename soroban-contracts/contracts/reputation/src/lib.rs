@@ -5,11 +5,14 @@
 //! Computes time-decayed, stake-weighted scores from signed attestations
 //! while resisting Sybil, collusion, and self-dealing attacks.
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, Vec};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, String, Vec,
+};
 
 use guildworkman_governance_guard as governance;
 pub use guildworkman_governance_guard::{
-    PauseState, PendingRotation, PendingUpgrade, ALL_SCOPES, MAX_PAUSE_DURATION, SCOPE_ATTESTATION,
+    PauseState, PendingRotation, PendingUpgrade, ALL_SCOPES, MAX_PAUSE_DURATION,
+    MAX_PAUSE_REASON_LEN, SCOPE_ATTESTATION,
 };
 
 /// Bump when this contract's storage layout actually changes shape and
@@ -141,6 +144,7 @@ pub enum Error {
     InvalidPauseScope = 30,
     InvalidPauseDuration = 31,
     NotPaused = 32,
+    InvalidPauseReason = 33,
 }
 
 impl From<governance::GovernanceError> for Error {
@@ -166,6 +170,7 @@ impl From<governance::GovernanceError> for Error {
             governance::GovernanceError::InvalidPauseScope => Error::InvalidPauseScope,
             governance::GovernanceError::InvalidPauseDuration => Error::InvalidPauseDuration,
             governance::GovernanceError::NotPaused => Error::NotPaused,
+            governance::GovernanceError::InvalidPauseReason => Error::InvalidPauseReason,
         }
     }
 }
@@ -340,8 +345,9 @@ impl ReputationContract {
         caller: Address,
         scopes: u32,
         duration_secs: u64,
+        reason: String,
     ) -> Result<PauseState, Error> {
-        governance::pause(&env, caller, scopes, duration_secs).map_err(Into::into)
+        governance::pause(&env, caller, scopes, duration_secs, reason).map_err(Into::into)
     }
 
     /// Clears `scopes` from the active pause early. Returns the scopes still

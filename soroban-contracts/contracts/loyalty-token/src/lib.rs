@@ -12,7 +12,8 @@ use soroban_sdk::{
 
 use guildworkman_governance_guard as governance;
 pub use guildworkman_governance_guard::{
-    PauseState, PendingRotation, PendingUpgrade, ALL_SCOPES, MAX_PAUSE_DURATION, SCOPE_INTAKE,
+    PauseState, PendingRotation, PendingUpgrade, ALL_SCOPES, MAX_PAUSE_DURATION,
+    MAX_PAUSE_REASON_LEN, SCOPE_INTAKE,
 };
 
 /// Bump when this contract's storage layout actually changes shape and
@@ -76,6 +77,7 @@ pub enum Error {
     InvalidPauseScope = 25,
     InvalidPauseDuration = 26,
     NotPaused = 27,
+    InvalidPauseReason = 28,
 }
 
 impl From<governance::GovernanceError> for Error {
@@ -101,6 +103,7 @@ impl From<governance::GovernanceError> for Error {
             governance::GovernanceError::InvalidPauseScope => Error::InvalidPauseScope,
             governance::GovernanceError::InvalidPauseDuration => Error::InvalidPauseDuration,
             governance::GovernanceError::NotPaused => Error::NotPaused,
+            governance::GovernanceError::InvalidPauseReason => Error::InvalidPauseReason,
         }
     }
 }
@@ -266,8 +269,9 @@ impl LoyaltyToken {
         caller: Address,
         scopes: u32,
         duration_secs: u64,
+        reason: String,
     ) -> Result<PauseState, Error> {
-        governance::pause(&env, caller, scopes, duration_secs).map_err(Into::into)
+        governance::pause(&env, caller, scopes, duration_secs, reason).map_err(Into::into)
     }
 
     /// Clears `scopes` from the active pause early. Returns the scopes still

@@ -10,13 +10,14 @@
 //! is what gives `env.storage()` a current contract to work on.
 
 use soroban_sdk::{
-    contract, testutils::Address as _, testutils::Events as _, testutils::Ledger, Address, Env, Vec,
+    contract, testutils::Address as _, testutils::Events as _, testutils::Ledger, Address, Env,
+    String, Vec,
 };
 
 use crate::{
     get_pause_state, init_governance, is_paused, pause, paused_scopes, require_not_paused, unpause,
-    GovernanceError, GovernanceInit, PauseState, ALL_SCOPES, MAX_PAUSE_DURATION, SCOPE_ATTESTATION,
-    SCOPE_INTAKE, SCOPE_SETTLEMENT,
+    GovernanceError, GovernanceInit, PauseState, ALL_SCOPES, MAX_PAUSE_DURATION,
+    MAX_PAUSE_REASON_LEN, SCOPE_ATTESTATION, SCOPE_INTAKE, SCOPE_SETTLEMENT,
 };
 
 #[contract]
@@ -64,14 +65,28 @@ impl Ctx {
         self.signers.get_unchecked(i)
     }
 
+    /// Most tests don't care about the reason, so this helper supplies an
+    /// empty one; `pause_with_reason` is for the tests that do.
     fn pause(
         &self,
         caller: Address,
         scopes: u32,
         duration: u64,
     ) -> Result<PauseState, GovernanceError> {
-        self.env
-            .as_contract(&self.host, || pause(&self.env, caller, scopes, duration))
+        self.pause_with_reason(caller, scopes, duration, "")
+    }
+
+    fn pause_with_reason(
+        &self,
+        caller: Address,
+        scopes: u32,
+        duration: u64,
+        reason: &str,
+    ) -> Result<PauseState, GovernanceError> {
+        let reason = String::from_str(&self.env, reason);
+        self.env.as_contract(&self.host, || {
+            pause(&self.env, caller, scopes, duration, reason)
+        })
     }
 
     fn unpause(&self, caller: Address, scopes: u32) -> Result<u32, GovernanceError> {
@@ -436,7 +451,9 @@ fn pause_before_governance_is_initialized_fails() {
     let host = env.register(TestHost, ());
     let caller = Address::generate(&env);
 
-    let result = env.as_contract(&host, || pause(&env, caller, ALL_SCOPES, 3_600));
+    let result = env.as_contract(&host, || {
+        pause(&env, caller, ALL_SCOPES, 3_600, String::from_str(&env, ""))
+    });
     assert_eq!(result, Err(GovernanceError::NotInitialized));
 }
 
@@ -526,4 +543,178 @@ fn a_rejected_unpause_emits_nothing_and_leaves_the_pause_standing() {
     let _ = ctx.unpause(Address::generate(&ctx.env), ALL_SCOPES);
     assert_eq!(ctx.env.events().all().events().len(), 0);
     assert_eq!(ctx.scopes(), ALL_SCOPES);
+}
+
+// ---------------------------------------------------------------------------
+// Operator reason
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_reason_round_trips_through_storage_and_the_event() {
+    let ctx = setup();
+    let state = ctx
+        .pause_with_reason(ctx.signer(0), SCOPE_INTAKE, 3_600, "INC-412 accounting")
+        .unwrap();
+
+    // Checked before any further invocation: `events().all()` reports only
+    // the most recent top-level call.
+    assert_eq!(ctx.env.events().all().events().len(), 1);
+
+    assert_eq!(
+        state.reason,
+        String::from_str(&ctx.env, "INC-412 accounting")
+    );
+    // Read back through the view, not just the return value — the round trip
+    // through instance storage is the part that could silently drop it.
+    assert_eq!(ctx.state().unwrap().reason, state.reason);
+}
+
+#[test]
+fn an_empty_reason_is_allowed() {
+    // The field must never stand between a responder and a halt.
+    let ctx = setup();
+    let state = ctx
+        .pause_with_reason(ctx.signer(0), ALL_SCOPES, 3_600, "")
+        .unwrap();
+    assert_eq!(state.reason.len(), 0);
+    assert_eq!(ctx.scopes(), ALL_SCOPES);
+}
+
+#[test]
+fn a_reason_at_exactly_the_cap_is_accepted() {
+    let ctx = setup();
+    let at_cap = "0123456789012345678901234567890123456789012345678901234567890123";
+    assert_eq!(at_cap.len() as u32, MAX_PAUSE_REASON_LEN);
+
+    let state = ctx
+        .pause_with_reason(ctx.signer(0), SCOPE_INTAKE, 3_600, at_cap)
+        .unwrap();
+    assert_eq!(state.reason.len(), MAX_PAUSE_REASON_LEN);
+}
+
+#[test]
+fn a_reason_over_the_cap_is_rejected_and_places_no_pause() {
+    let ctx = setup();
+    let over_cap = "01234567890123456789012345678901234567890123456789012345678901234";
+    assert_eq!(over_cap.len() as u32, MAX_PAUSE_REASON_LEN + 1);
+
+    assert_eq!(
+        ctx.pause_with_reason(ctx.signer(0), SCOPE_INTAKE, 3_600, over_cap),
+        Err(GovernanceError::InvalidPauseReason)
+    );
+    assert_eq!(ctx.scopes(), 0);
+    assert_eq!(ctx.env.events().all().events().len(), 0);
+}
+
+#[test]
+fn replacing_a_pause_replaces_its_reason_too() {
+    let ctx = setup();
+    ctx.pause_with_reason(ctx.signer(0), SCOPE_INTAKE, 3_600, "first")
+        .unwrap();
+    ctx.pause_with_reason(ctx.signer(1), SCOPE_SETTLEMENT, 3_600, "second")
+        .unwrap();
+
+    assert_eq!(
+        ctx.state().unwrap().reason,
+        String::from_str(&ctx.env, "second")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Storage round-trip
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_whole_pause_record_survives_a_storage_round_trip() {
+    // `PauseState` is a `#[contracttype]` struct written to instance storage;
+    // this pins every field against a serialization regression, not just the
+    // ones the guards happen to read.
+    let ctx = setup();
+    let signer = ctx.signer(1);
+    let returned = ctx
+        .pause_with_reason(
+            signer.clone(),
+            SCOPE_INTAKE | SCOPE_ATTESTATION,
+            7_200,
+            "INC-9",
+        )
+        .unwrap();
+
+    let raw: PauseState = ctx.env.as_contract(&ctx.host, || {
+        ctx.env
+            .storage()
+            .instance()
+            .get(&crate::GovernanceDataKey::PauseState)
+            .unwrap()
+    });
+
+    assert_eq!(raw, returned);
+    assert_eq!(raw.scopes, SCOPE_INTAKE | SCOPE_ATTESTATION);
+    assert_eq!(raw.paused_by, signer);
+    assert_eq!(raw.paused_at, 1_000);
+    assert_eq!(raw.expires_at, 8_200);
+    assert_eq!(raw.reason, String::from_str(&ctx.env, "INC-9"));
+}
+
+// ---------------------------------------------------------------------------
+// Ordering & the "concurrent" case
+// ---------------------------------------------------------------------------
+//
+// Soroban has no concurrency to race: transactions in a ledger are strictly
+// ordered, and the host forbids re-entering a contract already on the call
+// stack. "Two signers acting at once" is therefore always one after the
+// other, and what matters is that the second observes the first's record
+// rather than a stale copy. These pin that.
+
+#[test]
+fn a_second_signers_pause_observes_and_replaces_the_first() {
+    let ctx = setup();
+    ctx.pause_with_reason(ctx.signer(0), SCOPE_INTAKE, 3_600, "a")
+        .unwrap();
+    let second = ctx
+        .pause_with_reason(ctx.signer(1), SCOPE_SETTLEMENT, 1_800, "b")
+        .unwrap();
+
+    assert_eq!(ctx.state().unwrap(), second);
+    assert_eq!(second.paused_by, ctx.signer(1));
+    assert_eq!(ctx.scopes(), SCOPE_SETTLEMENT);
+}
+
+#[test]
+fn unpause_immediately_after_pause_in_the_same_ledger_leaves_nothing_halted() {
+    let ctx = setup();
+    ctx.pause(ctx.signer(0), ALL_SCOPES, 3_600).unwrap();
+    assert_eq!(ctx.unpause(ctx.signer(1), ALL_SCOPES).unwrap(), 0);
+    assert_eq!(ctx.scopes(), 0);
+
+    // And a re-pause after that starts clean rather than resurrecting scopes.
+    let state = ctx.pause(ctx.signer(2), SCOPE_INTAKE, 3_600).unwrap();
+    assert_eq!(state.scopes, SCOPE_INTAKE);
+    assert_eq!(ctx.scopes(), SCOPE_INTAKE);
+}
+
+#[test]
+fn repeated_guard_consultations_within_one_ledger_all_agree() {
+    // Expiry is evaluated per consultation, so the worry would be a call
+    // observing "paused" once and "open" a moment later. The ledger timestamp
+    // is fixed for the whole transaction, so it cannot.
+    let ctx = setup();
+    ctx.pause(ctx.signer(0), SCOPE_INTAKE, 3_600).unwrap();
+
+    ctx.env.as_contract(&ctx.host, || {
+        let first = require_not_paused(&ctx.env, SCOPE_INTAKE);
+        let second = require_not_paused(&ctx.env, SCOPE_INTAKE);
+        let third = paused_scopes(&ctx.env);
+        assert_eq!(first, Err(GovernanceError::OperationPaused));
+        assert_eq!(second, Err(GovernanceError::OperationPaused));
+        assert_eq!(third, SCOPE_INTAKE);
+    });
+
+    // Cross the deadline and the same batch flips together, not piecemeal.
+    set_time(&ctx.env, 1_000 + 3_600);
+    ctx.env.as_contract(&ctx.host, || {
+        assert_eq!(require_not_paused(&ctx.env, SCOPE_INTAKE), Ok(()));
+        assert_eq!(require_not_paused(&ctx.env, ALL_SCOPES), Ok(()));
+        assert_eq!(paused_scopes(&ctx.env), 0);
+    });
 }

@@ -198,6 +198,13 @@ fn migrate_by_non_signer_fails() {
 // and absolute: `mint` is halted, and nothing a holder does with a balance
 // they already own ever is.
 
+/// Reason string for tests that don't exercise the field itself. Kept
+/// non-empty so the round-trip through storage is actually covered by every
+/// pause test rather than only the ones that look at it.
+fn reason(env: &Env) -> soroban_sdk::String {
+    soroban_sdk::String::from_str(env, "INC-000 test")
+}
+
 fn set_time(env: &Env, timestamp: u64) {
     use soroban_sdk::testutils::Ledger as _;
     env.ledger().with_mut(|l| l.timestamp = timestamp);
@@ -209,7 +216,12 @@ fn paused_intake_blocks_minting() {
     let user = Address::generate(&env);
 
     set_time(&env, 1_000);
-    contract.pause(&signers.get_unchecked(0), &SCOPE_INTAKE, &3_600);
+    contract.pause(
+        &signers.get_unchecked(0),
+        &SCOPE_INTAKE,
+        &3_600,
+        &reason(&contract.env),
+    );
 
     let res = contract.try_mint(&user, &1_000);
     assert_eq!(res, Err(Ok(Error::OperationPaused)));
@@ -227,7 +239,12 @@ fn holders_keep_full_control_of_existing_balances_while_everything_is_paused() {
     contract.mint(&user, &1_000);
 
     set_time(&env, 1_000);
-    contract.pause(&signers.get_unchecked(0), &ALL_SCOPES, &3_600);
+    contract.pause(
+        &signers.get_unchecked(0),
+        &ALL_SCOPES,
+        &3_600,
+        &reason(&contract.env),
+    );
     assert_eq!(contract.paused_scopes(), ALL_SCOPES);
 
     contract.transfer(&user, &other, &100);
@@ -255,7 +272,12 @@ fn minting_resumes_on_its_own_once_the_pause_expires() {
     let user = Address::generate(&env);
 
     set_time(&env, 1_000);
-    contract.pause(&signers.get_unchecked(0), &SCOPE_INTAKE, &3_600);
+    contract.pause(
+        &signers.get_unchecked(0),
+        &SCOPE_INTAKE,
+        &3_600,
+        &reason(&contract.env),
+    );
     assert_eq!(
         contract.try_mint(&user, &1_000),
         Err(Ok(Error::OperationPaused))
@@ -274,7 +296,7 @@ fn a_non_signer_cannot_pause_the_token() {
     let (env, contract, _signers) = setup_with_signers();
     let outsider = Address::generate(&env);
 
-    let res = contract.try_pause(&outsider, &ALL_SCOPES, &3_600);
+    let res = contract.try_pause(&outsider, &ALL_SCOPES, &3_600, &reason(&contract.env));
     assert_eq!(res, Err(Ok(Error::NotASigner)));
     assert_eq!(contract.paused_scopes(), 0);
 }
@@ -288,6 +310,7 @@ fn a_pause_longer_than_the_cap_is_refused() {
         &signers.get_unchecked(0),
         &SCOPE_INTAKE,
         &(MAX_PAUSE_DURATION + 1),
+        &reason(&contract.env),
     );
     assert_eq!(res, Err(Ok(Error::InvalidPauseDuration)));
     assert_eq!(contract.paused_scopes(), 0);
@@ -299,9 +322,62 @@ fn any_signer_can_lift_a_pause_placed_by_another() {
     let user = Address::generate(&env);
 
     set_time(&env, 1_000);
-    contract.pause(&signers.get_unchecked(0), &SCOPE_INTAKE, &3_600);
+    contract.pause(
+        &signers.get_unchecked(0),
+        &SCOPE_INTAKE,
+        &3_600,
+        &reason(&contract.env),
+    );
     assert_eq!(contract.unpause(&signers.get_unchecked(2), &ALL_SCOPES), 0);
 
     contract.mint(&user, &1_000);
     assert_eq!(contract.balance(&user), 1_000);
+}
+
+#[test]
+fn scopes_the_token_has_no_entrypoints_for_are_well_formed_no_ops() {
+    // An operator sweeping every contract with one mask must not have to
+    // special-case which scopes a given contract implements. Settlement and
+    // attestation mean nothing here, and must not bleed into `mint`.
+    let (env, contract, signers) = setup_with_signers();
+    let user = Address::generate(&env);
+
+    set_time(&env, 1_000);
+    contract.pause(
+        &signers.get_unchecked(0),
+        &(governance::SCOPE_SETTLEMENT | governance::SCOPE_ATTESTATION),
+        &3_600,
+        &reason(&contract.env),
+    );
+
+    assert_eq!(
+        contract.paused_scopes(),
+        governance::SCOPE_SETTLEMENT | governance::SCOPE_ATTESTATION
+    );
+    contract.mint(&user, &1_000);
+    assert_eq!(contract.balance(&user), 1_000);
+}
+
+#[test]
+fn an_over_long_pause_reason_is_rejected() {
+    let (env, contract, signers) = setup_with_signers();
+    set_time(&env, 1_000);
+
+    let too_long = soroban_sdk::String::from_str(
+        &env,
+        "01234567890123456789012345678901234567890123456789012345678901234",
+    );
+    let res = contract.try_pause(&signers.get_unchecked(0), &SCOPE_INTAKE, &3_600, &too_long);
+    assert_eq!(res, Err(Ok(Error::InvalidPauseReason)));
+    assert_eq!(contract.paused_scopes(), 0);
+}
+
+#[test]
+fn the_pause_reason_is_readable_from_chain_state() {
+    let (env, contract, signers) = setup_with_signers();
+    set_time(&env, 1_000);
+    let why = soroban_sdk::String::from_str(&env, "INC-412 mint overflow");
+    contract.pause(&signers.get_unchecked(0), &SCOPE_INTAKE, &3_600, &why);
+
+    assert_eq!(contract.get_pause_state().unwrap().reason, why);
 }

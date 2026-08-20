@@ -679,6 +679,13 @@ fn migrate_with_nothing_to_migrate_fails() {
 // contract: `submit_attestation` is halted by `SCOPE_ATTESTATION` and nothing
 // else in this contract is halted by anything.
 
+/// Reason string for tests that don't exercise the field itself. Kept
+/// non-empty so the round-trip through storage is actually covered by every
+/// pause test rather than only the ones that look at it.
+fn reason(env: &Env) -> soroban_sdk::String {
+    soroban_sdk::String::from_str(env, "INC-000 test")
+}
+
 fn set_time(env: &Env, timestamp: u64) {
     env.ledger().with_mut(|l| l.timestamp = timestamp);
 }
@@ -690,7 +697,12 @@ fn paused_attestations_are_rejected_and_write_no_state() {
     let worker = Address::generate(&env);
 
     set_time(&env, 1_000);
-    contract.pause(&signers.get_unchecked(0), &SCOPE_ATTESTATION, &3_600);
+    contract.pause(
+        &signers.get_unchecked(0),
+        &SCOPE_ATTESTATION,
+        &3_600,
+        &reason(&contract.env),
+    );
 
     let res = contract.try_submit_attestation(&1, &client, &worker, &5, &dummy_hash(&env));
     assert_eq!(res, Err(Ok(Error::OperationPaused)));
@@ -713,7 +725,12 @@ fn scores_stay_readable_while_attestations_are_paused() {
     contract.submit_attestation(&1, &client, &worker, &4, &dummy_hash(&env));
 
     set_time(&env, 1_000);
-    contract.pause(&signers.get_unchecked(0), &ALL_SCOPES, &3_600);
+    contract.pause(
+        &signers.get_unchecked(0),
+        &ALL_SCOPES,
+        &3_600,
+        &reason(&contract.env),
+    );
 
     assert_eq!(contract.get_reputation_score_x10000(&worker), 40_000);
     assert_eq!(contract.get_attestation_count(&worker), 1);
@@ -727,7 +744,12 @@ fn attestations_resume_on_their_own_once_the_pause_expires() {
     let worker = Address::generate(&env);
 
     set_time(&env, 1_000);
-    contract.pause(&signers.get_unchecked(0), &SCOPE_ATTESTATION, &3_600);
+    contract.pause(
+        &signers.get_unchecked(0),
+        &SCOPE_ATTESTATION,
+        &3_600,
+        &reason(&contract.env),
+    );
     let res = contract.try_submit_attestation(&1, &client, &worker, &5, &dummy_hash(&env));
     assert_eq!(res, Err(Ok(Error::OperationPaused)));
 
@@ -753,6 +775,7 @@ fn a_scope_this_contract_has_no_entrypoints_for_is_a_well_formed_no_op() {
         &signers.get_unchecked(0),
         &(governance::SCOPE_INTAKE | governance::SCOPE_SETTLEMENT),
         &3_600,
+        &reason(&contract.env),
     );
 
     contract.submit_attestation(&1, &client, &worker, &5, &dummy_hash(&env));
@@ -764,7 +787,7 @@ fn a_non_signer_cannot_pause_reputation() {
     let (env, contract, _admin, _signers) = setup_with_governance();
     let outsider = Address::generate(&env);
 
-    let res = contract.try_pause(&outsider, &ALL_SCOPES, &3_600);
+    let res = contract.try_pause(&outsider, &ALL_SCOPES, &3_600, &reason(&contract.env));
     assert_eq!(res, Err(Ok(Error::NotASigner)));
     assert_eq!(contract.paused_scopes(), 0);
 }
@@ -774,7 +797,7 @@ fn the_config_admin_is_not_a_pause_authority() {
     // `admin` owns `update_config`/`set_stake`; the breaker answers to the
     // governance signer set instead.
     let (_env, contract, admin, _signers) = setup_with_governance();
-    let res = contract.try_pause(&admin, &ALL_SCOPES, &3_600);
+    let res = contract.try_pause(&admin, &ALL_SCOPES, &3_600, &reason(&contract.env));
     assert_eq!(res, Err(Ok(Error::NotASigner)));
 }
 
@@ -787,6 +810,7 @@ fn a_pause_longer_than_the_cap_is_refused() {
         &signers.get_unchecked(0),
         &ALL_SCOPES,
         &(MAX_PAUSE_DURATION + 1),
+        &reason(&contract.env),
     );
     assert_eq!(res, Err(Ok(Error::InvalidPauseDuration)));
     assert_eq!(contract.paused_scopes(), 0);
@@ -804,7 +828,7 @@ fn pause_views_report_the_active_window() {
     let (env, contract, _admin, signers) = setup_with_governance();
     let signer = signers.get_unchecked(2);
     set_time(&env, 1_000);
-    contract.pause(&signer, &SCOPE_ATTESTATION, &7_200);
+    contract.pause(&signer, &SCOPE_ATTESTATION, &7_200, &reason(&contract.env));
 
     let state = contract.get_pause_state().unwrap();
     assert_eq!(state.scopes, SCOPE_ATTESTATION);
