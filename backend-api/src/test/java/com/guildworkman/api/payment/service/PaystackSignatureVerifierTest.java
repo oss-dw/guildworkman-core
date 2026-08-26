@@ -1,5 +1,6 @@
 package com.guildworkman.api.payment.service;
 
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -29,7 +30,7 @@ class PaystackSignatureVerifierTest {
     void setUp() {
         properties = new PaystackProperties();
         properties.setSecretKey(SECRET);
-        verifier = new PaystackSignatureVerifier(properties);
+        verifier = new PaystackSignatureVerifier(properties, new PaymentMetrics(new SimpleMeterRegistry()));
     }
 
     @Test

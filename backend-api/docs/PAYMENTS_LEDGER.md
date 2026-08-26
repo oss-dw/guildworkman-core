@@ -10,6 +10,57 @@ The problem it closes is stated plainly in the issue: **money that can be lost
 by closing a browser tab**. Before this, payment state depended on the client
 returning from a redirect. It no longer does.
 
+## How it fits together
+
+The money path, from a Paystack delivery to a row an operator can read. The
+signature check and the claim insert are the two gates — nothing downstream of
+them runs twice, and nothing upstream of them is trusted.
+
+```mermaid
+flowchart TD
+    PS[Paystack] -->|POST raw bytes + x-paystack-signature| WC[PaystackWebhookController]
+    WC --> V{HMAC-SHA512 over raw bytes}
+    V -->|mismatch / missing / no secret| R401[401 — nothing parsed, nothing written]
+    V -->|verified| P[PaystackEventParser<br/>derives idempotency key]
+    P --> T[/single transaction/]
+
+    subgraph T [One transaction: claim + effect]
+        C{insert ProcessedWebhookEvent<br/>unique on event_key}
+        C -->|duplicate key| DUP[DUPLICATE — rolled back, no effect]
+        C -->|claimed| SM{Payment / Payout state machine}
+        SM -->|illegal transition| DISC[record discrepancy → REJECTED]
+        SM -->|legal| L[LedgerService posts a balanced<br/>debit/credit journal entry]
+        L --> PROJ[Payment / Payout updated<br/>Transaction projection rebuilt]
+    end
+
+    T --> OK[200 — always, once the signature verifies]
+```
+
+Reconciliation runs on its own schedule and never writes to the journal — it
+compares and reports:
+
+```mermaid
+flowchart LR
+    S[@Scheduled sweep] --> Q[unreconciled payments<br/>older than the grace window]
+    Q --> API[Paystack verify API<br/>no transaction held open]
+    API --> CMP{platform books vs provider}
+    CMP -->|agree| MARK[mark reconciled]
+    CMP -->|diverge| D[(ReconciliationDiscrepancy<br/>deduped, OPEN)]
+    TB[trial balance:<br/>total debits vs total credits] --> D
+    D --> OPS[operator: acknowledge / resolve<br/>ADMIN endpoints]
+```
+
+The journal is the source of truth; everything to the right of it is derived
+and can be rebuilt from it:
+
+```mermaid
+flowchart LR
+    LT[LedgerTransaction + LedgerEntry<br/>append-only journal] --> PAY[Payment / Payout<br/>current state cache]
+    LT --> TX[Transaction<br/>client-facing projection]
+    TX --> TH[TransactionHistory<br/>query over Transaction]
+    LT --> BAL[Account balances / trial balance<br/>summed, never stored]
+```
+
 ## What was there before
 
 - `controllers/PaymentController.java` was entirely commented out — no payment
@@ -100,11 +151,23 @@ journal — which is exactly why it is safe for them to be mutable. If a view
 ever disagrees with the journal, the journal is right by definition and the
 view can be rebuilt.
 
-Append-only is enforced twice: every column on both entities is
-`updatable = false` and neither class exposes a setter (so there is no
-in-process path to a mutation), and a `@PreUpdate` callback turns any mutation
-that somehow reaches a flush into a loud failure rather than a silently
-dropped write. `LedgerPostingTest` asserts both, including that no setter has
+Append-only is enforced in two layers, and it is worth being precise about
+which one actually fires. Every column on both entities is `updatable = false`
+and neither class exposes a setter, so there is no in-process path to a
+mutation. That mapping is the defence that engages: because no column is
+updatable, Hibernate emits no UPDATE for a dirty posting at all. The
+`@PreUpdate` callback is a **backstop**, not the primary guard — it exists for
+the day someone adds a column and forgets the flag, and in the current mapping
+it is never reached.
+
+`LedgerAppendOnlyJpaTest` pins this at the JPA level rather than by calling
+the guard directly: a posting that is reflectively rewritten and flushed
+leaves the stored row untouched, and — the case that would actually hurt — a
+posting merely attached to the persistence context does **not** trip anything
+when unrelated entities are written and flushed in the same unit of work. An
+unconditional `@PreUpdate` that misfired there would break the capture path
+itself, which loads postings and saves a `Payment` in one transaction.
+`LedgerPostingTest` separately asserts the guard method and that no setter has
 crept back in.
 
 Deletes are **not** blocked at the JPA layer. No application code path deletes
@@ -513,20 +576,83 @@ simply hasn't arrived yet will show up as a `PROVIDER_STATUS_DIVERGENCE` that
 the next successful delivery makes moot — and the finding's dedupe key stops
 it being re-filed.
 
+### Rotating the Paystack secret key
+
+The secret both verifies inbound webhook signatures and authenticates outbound
+API calls, and Paystack signs with whichever key is live at the moment it
+sends. There is no dual-key window on the provider side, so a rotation is a
+brief period where in-flight deliveries are signed with the old key.
+
+The sequence that loses nothing:
+
+1. Rotate the key in the Paystack dashboard.
+2. Update `PAYSTACK_SECRET_KEY` in the secret store and restart/redeploy so
+   `payments.paystack.secret-key` picks it up. It is read from the environment
+   only — it is never in `application.properties`, in the image, or in git.
+3. Watch `payments.webhook.signature.failures{reason="MISMATCH"}`. A short
+   spike during the swap is expected: those are deliveries signed with the old
+   key that arrived after the restart.
+4. Paystack retries a non-2xx delivery, and a rejected webhook answers 401, so
+   those events come back on their own once the new key is live. Nothing needs
+   replaying by hand.
+5. Confirm `payments.webhook.events{outcome="APPLIED"}` resumes. If
+   `signature.failures{reason="MISMATCH"}` stays elevated after the retry
+   window, the deployed key and the dashboard key do not match — check step 2
+   before assuming an attack.
+
+**`reason="NOT_CONFIGURED"` is the dangerous one.** It means the variable is
+absent entirely and *every* webhook is being dropped. It fails closed by
+design, but the symptom — payments silently not capturing — is indistinguishable
+from a quiet day, which is why it has its own counter and deserves a page.
+
+If a key is believed compromised, rotate first and reconcile after: a sweep
+(`POST /api/v1/payments/reconciliation/run`) re-reads provider state for every
+unreconciled payment and files a finding for anything that diverged while the
+old key was valid.
+
 ## Observability
 
-Structured logs, not metrics — the same call `ESCROW_ORCHESTRATION.md` made,
-for the same reason: there is no Actuator/Micrometer dependency anywhere in
-this codebase, and introducing one is a cross-cutting infrastructure decision
-(new dependency, `/actuator` exposure, security implications) that deserves
-its own discussion rather than being folded into a feature PR.
+### Metrics
+
+`PaymentMetrics` publishes Micrometer counters at `/actuator/prometheus`,
+following the `SigningMetrics` convention already in this codebase.
+
+| Meter | Tags | Alert on |
+|---|---|---|
+| `payments.webhook.events` | `type`, `outcome` | A sustained `REJECTED` rate; `APPLIED` dropping to zero during business hours |
+| `payments.webhook.signature.failures` | `reason` | **Any** `NOT_CONFIGURED` — the secret is missing and every payment notification is being dropped. A rising `MISMATCH` is someone probing the endpoint |
+| `payments.reconciliation.discrepancies` | `type` | Any `LEDGER_IMBALANCE` (page immediately); a rising `PROVIDER_STATUS_DIVERGENCE` |
+| `payments.reconciliation.sweeps` | `outcome` | `outcome=failed`, and `completed` going flat — a stalled sweep looks exactly like "no divergence found" |
+| `payments.provider.unreachable` | — | A sustained rate means Paystack is unreachable, not that nothing is happening |
+
+Tag values are closed sets. The event `type` is the one piece of
+caller-supplied data it would be tempting to tag with directly, and doing so
+would let anyone who can reach the webhook mint unbounded time series by
+POSTing new type strings; `PaymentMetrics.eventType` collapses anything
+outside the handled set to `other`. No reference, event key or account is ever
+a tag — those live in logs.
+
+The counters exist because the failures that matter here are the silent ones.
+A rotated secret that was never redeployed throws nowhere an operator is
+looking; it just rejects every webhook, and the first visible symptom is that
+captures stopped some hours ago.
+
+### Logs
 
 Every state transition, ledger posting, event outcome and discrepancy is
 logged with the reference, so a log search on a payment reference reconstructs
-its whole history. Discrepancies are logged at WARN with both states in the
-message, so a log-based alert works before anyone builds a dashboard over the
-table. Paystack response bodies are truncated to 500 characters before being
-logged or embedded in an exception message.
+its whole history. Discrepancies are logged at WARN with the **discrepancy
+id** and both states in the message, and a refused event logs the same id, so
+triage goes straight from the log line to
+`/api/v1/payments/reconciliation/discrepancies` without joining tables by
+timestamp. Paystack response bodies are truncated to 500 characters before
+being logged or embedded in an exception message.
+
+**Secrets are never logged.** The only log line that mentions the secret names
+the *property* (`payments.paystack.secret-key`), never a value; the
+invalid-signature line records the body length, not the supplied signature.
+`PaystackProperties` carries no Lombok `@ToString`, so the key cannot reach a
+log through an accidental interpolation of the properties object.
 
 ## Tests
 
@@ -536,6 +662,7 @@ logged or embedded in an exception message.
 | `PaystackEventParserTest` | Idempotency-key derivation, including one transfer id under two event types; malformed envelopes |
 | `PaystackClientTest` | The wire format against a `MockWebServer`; 404 vs. outage; path encoding; body truncation |
 | `PaymentLifecycleTest` | Every legal and illegal transition on both state machines |
+| `LedgerAppendOnlyJpaTest` | Append-only as JPA applies it: a rewritten posting leaves the row untouched, and a posting merely attached to the persistence context does not break unrelated writes in the same transaction |
 | `LedgerPostingTest` | Balance enforcement, negative and zero lines, append-only guards, absence of setters |
 | `MinorUnitsTest` | Two-decimal, zero-decimal and unknown currencies; refusal to round |
 | `PaymentWebhookIntegrationTest` | The money path end to end: capture, redelivery, 8-way concurrent redelivery, forged signature, out-of-order refund and reversal, partial and instalment refunds, payout settlement and reversal, and the trial balance after every scenario |

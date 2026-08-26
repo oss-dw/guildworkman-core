@@ -32,7 +32,12 @@ import lombok.NoArgsConstructor;
 @Table(name = "ledger_entries",
         indexes = {
                 @Index(name = "idx_ledger_entry_transaction", columnList = "ledger_transaction_id"),
-                @Index(name = "idx_ledger_entry_account", columnList = "account_id,currency")
+                @Index(name = "idx_ledger_entry_account", columnList = "account_id,currency"),
+                // The trial balance sums every entry filtered by currency and
+                // direction; without this it is a sequential scan of the whole
+                // journal on each sweep. Leading with currency matches both
+                // that query and the per-account one above.
+                @Index(name = "idx_ledger_entry_currency_direction", columnList = "currency,direction")
         })
 @Getter
 @NoArgsConstructor

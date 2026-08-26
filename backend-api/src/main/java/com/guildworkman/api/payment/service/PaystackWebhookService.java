@@ -33,6 +33,7 @@ public class PaystackWebhookService {
     private final PaystackSignatureVerifier verifier;
     private final PaystackEventParser parser;
     private final PaystackWebhookProcessor processor;
+    private final PaymentMetrics metrics;
 
     /**
      * @param rawBody          the exact bytes of the request body
@@ -44,12 +45,15 @@ public class PaystackWebhookService {
         verifier.verify(rawBody, suppliedSignature);
         PaystackEvent event = parser.parse(rawBody);
         try {
-            return processor.process(event);
+            WebhookOutcome outcome = processor.process(event);
+            metrics.webhookEvent(event.type(), outcome);
+            return outcome;
         } catch (DataIntegrityViolationException ex) {
             // Another delivery of this same event committed while this one was
             // in flight. Its transaction rolled back having applied nothing,
             // so the effect happened exactly once — by the other thread.
             log.info("Paystack event key={} was applied concurrently by another delivery", event.eventKey());
+            metrics.webhookEvent(event.type(), WebhookOutcome.DUPLICATE);
             return WebhookOutcome.DUPLICATE;
         }
     }

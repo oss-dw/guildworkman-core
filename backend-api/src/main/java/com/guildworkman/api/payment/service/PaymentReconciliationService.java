@@ -84,11 +84,24 @@ public class PaymentReconciliationService {
     private final PaymentProperties properties;
     private final TransactionService transactionService;
     private final ReconciliationDiscrepancyRepository discrepancyRepository;
+    private final PaymentMetrics metrics;
 
     @Scheduled(fixedDelayString = "${payments.reconciliation.poll-delay-ms:60000}")
     public void reconcile() {
-        reconcilePayments();
-        assertLedgerBalances();
+        // A @Scheduled method that throws is logged once by Spring's error
+        // handler and is otherwise invisible — the sweep simply stops
+        // happening, which looks exactly like "no divergence found". Counting
+        // the failure is what makes a stalled reconciler alertable, and the
+        // throw is preserved so the scheduler's own logging still fires.
+        try {
+            reconcilePayments();
+            assertLedgerBalances();
+            metrics.sweepCompleted(false);
+        } catch (RuntimeException ex) {
+            metrics.sweepCompleted(true);
+            log.error("Reconciliation sweep failed", ex);
+            throw ex;
+        }
     }
 
     /** @return how many payments were examined, for tests and for the log line. */
@@ -126,6 +139,7 @@ public class PaymentReconciliationService {
             // unreachable payment would turn a ten-minute outage into a
             // discrepancy table nobody can read.
             log.warn("Could not reconcile payment reference={}: {}", payment.getReference(), ex.getMessage());
+            metrics.providerUnreachable();
             return false;
         }
 

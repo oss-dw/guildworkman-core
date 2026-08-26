@@ -42,6 +42,19 @@ import java.util.HexFormat;
  * <p>The digest is over the raw bytes, the same bytes the signature was
  * checked against, so it cannot be influenced by how Jackson chose to parse
  * them.
+ *
+ * <p><b>Why not a canonicalized digest?</b> Normalizing the JSON first — sorting
+ * keys, dropping whitespace, or excluding volatile fields like a timestamp —
+ * would make the fallback survive a provider that re-serializes between
+ * retries. It is deliberately not done, for two reasons. Canonicalizing means
+ * hashing something other than what was signed, so the dedupe key would no
+ * longer be bound to the bytes the HMAC authenticated; and excluding fields
+ * requires deciding which ones are volatile, which is a guess about a payload
+ * schema this service does not own — guess wrong and two genuinely different
+ * events collapse onto one key, which drops a real event silently. The failure
+ * mode of the raw digest is a duplicate that gets refused loudly by the state
+ * machine; the failure mode of a bad canonicalization is a lost event. The
+ * first is the safer way to be wrong.
  */
 @Component
 @RequiredArgsConstructor

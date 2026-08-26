@@ -38,6 +38,7 @@ public class DiscrepancyRecorder {
 
     private final ReconciliationDiscrepancyRepository discrepancies;
     private final DiscrepancyInserter inserter;
+    private final PaymentMetrics metrics;
 
     /**
      * @return the newly recorded finding, or empty if an identical one is
@@ -62,8 +63,14 @@ public class DiscrepancyRecorder {
             log.debug("Discrepancy {} for reference={} was recorded concurrently", type, resourceReference);
             return Optional.empty();
         }
-        log.warn("Payment reconciliation discrepancy type={} reference={} platform={} provider={}: {}",
+        metrics.discrepancyRecorded(type);
+        Optional<ReconciliationDiscrepancy> recorded = discrepancies.findByDedupeKey(dedupeKey);
+        // The id is in the message so an operator triaging this line can go
+        // straight to /api/v1/payments/reconciliation/discrepancies without
+        // having to re-derive the dedupe key by hand.
+        log.warn("Payment reconciliation discrepancy id={} type={} reference={} platform={} provider={}: {}",
+                recorded.map(ReconciliationDiscrepancy::getId).orElse(null),
                 type, resourceReference, platformState, providerState, detail);
-        return discrepancies.findByDedupeKey(dedupeKey);
+        return recorded;
     }
 }

@@ -1,6 +1,7 @@
 package com.guildworkman.api.payment.service;
 
 import com.guildworkman.api.payment.model.DiscrepancyType;
+import com.guildworkman.api.payment.model.ReconciliationDiscrepancy;
 import com.guildworkman.api.payment.model.Payment;
 import com.guildworkman.api.payment.model.PaymentStatus;
 import com.guildworkman.api.payment.model.Payout;
@@ -136,8 +137,17 @@ public class PaystackWebhookProcessor {
             // The state machine refused before touching the entity, so nothing
             // is half-applied and this transaction can still commit the audit
             // row that says so.
-            discrepancies.record(DiscrepancyType.ILLEGAL_TRANSITION, ex.getResourceReference(),
-                    ex.getFrom(), event.type(), ex.getMessage());
+            Long discrepancyId = discrepancies.record(DiscrepancyType.ILLEGAL_TRANSITION,
+                            ex.getResourceReference(), ex.getFrom(), event.type(), ex.getMessage())
+                    .map(ReconciliationDiscrepancy::getId).orElse(null);
+            // An out-of-order or replayed-after-refund event is the case an
+            // operator is most likely to have to explain to someone, so the
+            // refusal says which event, which reference, which transition, and
+            // which finding to open — rather than leaving them to join the
+            // processed-event row to the discrepancy table by timestamp.
+            log.warn("Refused Paystack event key={} type={} reference={}: illegal transition from {} "
+                            + "(discrepancy id={})",
+                    event.eventKey(), event.type(), ex.getResourceReference(), ex.getFrom(), discrepancyId);
             return Result.rejected(ex.getMessage());
         }
     }
